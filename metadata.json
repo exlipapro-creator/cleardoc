@@ -1,0 +1,7 @@
+{
+  "name": "ClearDoc",
+  "description": "Precision Document Watermark Removal & Preservation Platform. Detect, review, remove, and verify watermarks with native document structure preservation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

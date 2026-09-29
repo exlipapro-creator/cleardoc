@@ -1,0 +1,48 @@
+/**
+ * ClearDoc System Configuration
+ * All limits, timings, and storage parameters are environment-driven.
+ */
+import path from 'path';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+export const CONFIG = {
+  PORT: parseInt(process.env.PORT || '3000', 10),
+  NODE_ENV: process.env.NODE_ENV || 'development',
+  
+  // Storage & Limits
+  MAX_FILE_SIZE_BYTES: parseInt(process.env.CLEARDOC_MAX_FILE_SIZE_BYTES || '31457280', 10), // 30 MB
+  MAX_PAGE_COUNT: parseInt(process.env.CLEARDOC_MAX_PAGE_COUNT || '50', 10),
+  RETENTION_MS: parseInt(process.env.CLEARDOC_RETENTION_MS || '3600000', 10), // 1 hour
+  CLEANUP_INTERVAL_MS: parseInt(process.env.CLEARDOC_CLEANUP_INTERVAL_MS || '300000', 10), // 5 min
+  
+  // Rendering DPI
+  THUMBNAIL_DPI: 72,
+  PREVIEW_DPI: parseInt(process.env.CLEARDOC_PREVIEW_DPI || '150', 10),
+  VERIFICATION_DPI: parseInt(process.env.CLEARDOC_VERIFICATION_DPI || '150', 10),
+
+  // Engine Versions
+  ENGINE_VERSIONS: {
+    detector: '1.0.0',
+    pdfEngine: '1.0.0',
+    restorationEngine: '1.0.0',
+    verificationEngine: '1.0.0',
+  },
+
+  // Storage Paths
+  BASE_STORAGE_DIR: path.resolve(process.cwd(), 'storage', 'temp'),
+
+  // Allowed Formats & MIME types
+  SUPPORTED_MIME_TYPES: [
+    'application/pdf',
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/tiff',
+  ],
+
+  // Verification Thresholds
+  VISUAL_CHANGE_MAX_TOLERANCE_RATIO: 0.25, // If visual changes exceed 25% of page without full watermark coverage, trigger review
+  UNEXPECTED_PIXEL_RADIUS_TOLERANCE: 12, // Pixel buffer around bounding box to tolerate anti-aliasing
+};
