@@ -33,7 +33,19 @@ export const CONFIG = {
   },
 
   // Storage Paths
-  BASE_STORAGE_DIR: path.resolve(process.cwd(), 'storage', 'temp'),
+  // V1 (default): per-instance local temp dir.
+  // V2 (opt-in): point CLEARDOC_SHARED_STORAGE_ROOT at a shared volume so all
+  // instances serve the same session file tree. Requires CLEARDOC_SHARED_DB_PATH.
+  BASE_STORAGE_DIR: path.resolve(
+    process.env.CLEARDOC_SHARED_STORAGE_ROOT || path.join(process.cwd(), 'storage', 'temp')
+  ),
+
+  // Shared persistence (V2 multi-instance, fully opt-in)
+  // When CLEARDOC_SHARED_DB_PATH is set, document/job/analysis/verification
+  // metadata moves from in-memory Maps to a SQLite database (node:sqlite, WAL)
+  // so multiple instances behind a load balancer share one source of truth.
+  SHARED_DB_PATH: process.env.CLEARDOC_SHARED_DB_PATH || '',
+  SHARED_STORAGE_ROOT: process.env.CLEARDOC_SHARED_STORAGE_ROOT || '',
 
   // Allowed Formats & MIME types
   SUPPORTED_MIME_TYPES: [

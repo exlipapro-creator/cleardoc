@@ -5,9 +5,9 @@
 | Command | What runs | Status at release |
 |---|---|---|
 | `npm run lint` | `tsc --noEmit` over the whole project (strict) | PASS |
-| `npm test` | 12 unit/integration tests via `tests/run-tests.ts` | 12/12 PASS |
-| `npm run test:e2e` | 70-check live E2E (`tests/e2e.ts`), boots a real dev server on an ephemeral port | 70/70 PASS |
-| `BUILD=prod npm run test:e2e` | The same 70 checks against `dist/server.js` + built SPA (production mode) | 70/70 PASS |
+| `npm test` | 13 unit/integration tests via `tests/run-tests.ts` (incl. SQLite backend cross-instance CAS) | 13/13 PASS |
+| `npm run test:e2e` | 84-check live E2E (`tests/e2e.ts`), boots real server processes on ephemeral ports | 84/84 PASS |
+| `BUILD=prod npm run test:e2e` | The same 84 checks against `dist/server.js` + built SPA (production mode) | 84/84 PASS |
 
 `npm ci && npm run build && npm test` is the reproducible clean-build gate;
 `npm install` works without `--legacy-peer-deps` (dependency tree aligned: esbuild
@@ -28,6 +28,8 @@
     COMPLETED→PROCESSING)
 11. Detector does not treat "COPYRIGHT" as a COPY watermark term
 12. Expired sessions purged from disk and metadata, idempotently
+13. SQLite backend cross-instance semantics: shared visibility, CAS claim race
+    (exactly one winner), illegal-transition rejection, session scoping, expiry cleanup
 
 ## E2E checklist (`tests/e2e.ts`)
 
@@ -64,6 +66,16 @@ The authoritative release gate. Boots its own server (ephemeral port, tsx dev or
 
 - Raster path under an expired deadline → 5xx `PROCESSING_FAILED`, retryable
   failure state (never a stuck `VERIFYING` or false `COMPLETED`), server healthy
+
+**Phase 4 — multi-instance (V2 shared mode):**
+
+- Boots two real server processes sharing one SQLite DB + storage root, then
+  drives every request through a round-robin "load balancer":
+- Shared visibility: upload on A → analyze on B → preview from A → process on
+  A → job read from B → download from B
+- IDOR holds across instances; both `/health` endpoints report `sqlite` backend
+- Cross-instance double-process race: exactly one 200 + one 409
+  `INVALID_STATE`, coherent terminal state, single output artifact
 
 Exit code 0 only when every check passes — wire it into CI as the release gate.
 

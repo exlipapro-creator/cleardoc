@@ -42,7 +42,11 @@ Per-session bucket, 20 expensive operations per 60 s window → `429
 RATE_LIMIT_EXCEEDED`. The limiter is registered **after** session resolution so
 buckets are keyed per session (a global-bucket mis-ordering was found and fixed —
 it would have allowed one client to lock out all others). Covers uploads, analysis,
-processing, fixtures.
+processing, fixtures. In shared multi-instance mode buckets remain per-instance
+(in-memory), so the effective limit scales with instance count — documented,
+acceptable for V2's abuse-protection goal. Session isolation itself is enforced
+in the shared backend, so it holds regardless of which instance receives the
+request (E2E M09/M10).
 
 ## Resource limits
 

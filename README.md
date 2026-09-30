@@ -88,14 +88,18 @@ NODE_ENV=production PORT=3000 node dist/server.js
 - Security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`)
   are set on every response. Run behind a reverse proxy for TLS termination.
 
-## Known limitations (V1)
+## Known limitations
 
-- **Single instance only.** All metadata is in-memory; files are local temp files.
-  Run exactly one process per storage directory. Multi-instance / horizontally
-  scaled deployment requires a shared store that V1 does not provide.
-- **Restart behavior:** in-flight jobs are lost on restart; their files become
-  orphans and are purged by the GC once retention elapses. The server never
-  reports a false `COMPLETED` after restart — documents simply no longer exist.
+- **Default mode is single-instance** (in-memory metadata + local temp files).
+  For two or more instances behind a load balancer, enable shared mode by
+  setting `CLEARDOC_SHARED_DB_PATH` (SQLite, zero external dependencies) and
+  `CLEARDOC_SHARED_STORAGE_ROOT` (shared volume) on every instance. See
+  `docs/deployment.md` for the verified topology and its constraints.
+- **Restart behavior (single-instance mode):** in-flight jobs are lost on
+  restart; their files become orphans and are purged by the GC once retention
+  elapses. The server never reports a false `COMPLETED` after restart —
+  documents simply no longer exist. In shared (multi-instance) mode, metadata
+  and files survive individual instance restarts.
 - **PDF manual regions are not supported** — the server rejects them explicitly
   rather than silently ignoring them.
 - Removal targets stamped/overlay watermarks on reasonably uniform backgrounds.

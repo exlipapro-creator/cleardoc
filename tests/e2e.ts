@@ -19,6 +19,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import os from 'os';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import sharp from 'sharp';
 
@@ -54,7 +55,8 @@ async function api(
   session: string | null,
   method: string,
   urlPath: string,
-  opts: { json?: any; body?: Buffer; contentType?: string } = {}
+  opts: { json?: any; body?: Buffer; contentType?: string } = {},
+  port: number = PORT
 ): Promise<ApiResult> {
   const headers: Record<string, string> = {};
   if (session) headers['x-session-id'] = session;
@@ -66,7 +68,7 @@ async function api(
     headers['content-type'] = opts.contentType || 'application/octet-stream';
     payload = opts.body;
   }
-  const res = await fetch(`http://127.0.0.1:${PORT}/api${urlPath}`, {
+  const res = await fetch(`http://127.0.0.1:${port}/api${urlPath}`, {
     method,
     headers,
     body: payload ? new Uint8Array(payload) : undefined,
@@ -144,8 +146,8 @@ function stopServer(child: ChildProcess): Promise<void> {
 // HTTP helpers over the public API (same entry points the UI uses)
 // ---------------------------------------------------------------------------
 
-async function createSample(session: string, fixtureType: string): Promise<ApiResult> {
-  return api(session, 'POST', '/fixtures/create-sample', { json: { fixtureType } });
+async function createSample(session: string, fixtureType: string, port: number = PORT): Promise<ApiResult> {
+  return api(session, 'POST', '/fixtures/create-sample', { json: { fixtureType } }, port);
 }
 
 async function upload(
@@ -164,15 +166,18 @@ async function upload(
   });
 }
 
-const analyze = (s: string, id: string) => api(s, 'POST', `/documents/${id}/analyze`);
-const getDoc = (s: string, id: string) => api(s, 'GET', `/documents/${id}`);
-const getAnalysis = (s: string, id: string) => api(s, 'GET', `/documents/${id}/analysis`);
-const download = (s: string, id: string) => api(s, 'GET', `/documents/${id}/download`);
-const preview = (s: string, id: string, page: number, type: string) =>
-  api(s, 'GET', `/documents/${id}/preview/${page}?type=${type}`);
+const analyze = (s: string, id: string, port: number = PORT) =>
+  api(s, 'POST', `/documents/${id}/analyze`, {}, port);
+const getDoc = (s: string, id: string, port: number = PORT) => api(s, 'GET', `/documents/${id}`, {}, port);
+const getAnalysis = (s: string, id: string, port: number = PORT) =>
+  api(s, 'GET', `/documents/${id}/analysis`, {}, port);
+const download = (s: string, id: string, port: number = PORT) =>
+  api(s, 'GET', `/documents/${id}/download`, {}, port);
+const preview = (s: string, id: string, page: number, type: string, port: number = PORT) =>
+  api(s, 'GET', `/documents/${id}/preview/${page}?type=${type}`, {}, port);
 
-async function processDoc(s: string, id: string, body: any = {}): Promise<ApiResult> {
-  return api(s, 'POST', `/documents/${id}/process`, { json: body });
+async function processDoc(s: string, id: string, body: any = {}, port: number = PORT): Promise<ApiResult> {
+  return api(s, 'POST', `/documents/${id}/process`, { json: body }, port);
 }
 
 /**
@@ -227,7 +232,7 @@ async function generateHighResRaster(w: number, h: number): Promise<Buffer> {
 // ---------------------------------------------------------------------------
 async function bootServer(
   envExtra: Record<string, string>
-): Promise<{ child: ChildProcess; log: { text: string } }> {
+): Promise<{ child: ChildProcess; log: { text: string }; port: number }> {
   PORT = await pickFreePort();
   console.log(`\n=== ClearDoc E2E phase — ${IS_PROD ? 'PRODUCTION build' : 'dev (tsx)'} — port ${PORT} ===\n`);
 
@@ -248,7 +253,7 @@ async function bootServer(
   child.stdout.on('data', (d) => (log.text += d.toString()));
   child.stderr.on('data', (d) => (log.text += d.toString()));
   await waitHealthy();
-  return { child, log };
+  return { child, log, port: PORT };
 }
 
 async function runCoreChecks(): Promise<void> {
@@ -558,6 +563,117 @@ async function runDeadlineGateChecks(): Promise<void> {
   }
 }
 
+/**
+ * Multi-instance phase: two real server processes share one SQLite metadata DB
+ * and one storage root (the V2 topology). A round-robin "load balancer" sends
+ * each request to alternating instances, proving the API contract survives
+ * instance hand-off: uploads on A are analyzable on B, previews/download
+ * resolve on either, IDOR stays closed across instances, and a cross-instance
+ * double-process race yields exactly one winner with a coherent terminal state
+ * and a single output artifact.
+ */
+async function runMultiInstanceChecks(): Promise<void> {
+  const sharedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cleardoc-shared-'));
+  const sharedDb = path.join(sharedDir, 'shared.db');
+  const sharedStorage = path.join(sharedDir, 'storage');
+  const ENV = {
+    CLEARDOC_SHARED_DB_PATH: sharedDb,
+    CLEARDOC_SHARED_STORAGE_ROOT: sharedStorage,
+  };
+
+  const instA = await bootServer(ENV);
+  const instB = await bootServer(ENV);
+  const { port: portA } = instA;
+  const { port: portB } = instB;
+
+  try {
+    // Both instances report shared mode.
+    const hA = await (await fetch(`http://127.0.0.1:${portA}/health`)).json();
+    const hB = await (await fetch(`http://127.0.0.1:${portB}/health`)).json();
+    check('M01 instance A reports sqlite metadata backend', hA.metadata === 'sqlite', JSON.stringify(hA));
+    check('M02 instance B reports sqlite metadata backend', hB.metadata === 'sqlite', JSON.stringify(hB));
+
+    // LB helper: alternate instances per request.
+    let flip = false;
+    const lb = <T>(call: (port: number) => Promise<T>): Promise<T> => {
+      flip = !flip;
+      return call(flip ? portA : portB);
+    };
+
+    const S = newSession();
+
+    // Upload on A...
+    const upM = await lb((p) => createSample(S, 'draft', p));
+    check('M03 upload via instance A → 201', upM.status === 201 && !!upM.json?.document?.id, `got ${upM.status}`);
+    const docM: string = upM.json?.document?.id ?? '';
+
+    // ...analyze on B (metadata + files live on shared store).
+    const anM = await lb((p) => analyze(S, docM, p));
+    check('M04 analyze via instance B → 200 with candidates', anM.status === 200 && anM.json?.analysis?.candidates?.length > 0, `got ${anM.status}`);
+    const candM = anM.json?.analysis?.candidates?.[0]?.id;
+
+    // ...previews (rendered by B during analyze) readable from A.
+    const pvM = await lb((p) => preview(S, docM, 1, 'original', p));
+    check('M05 preview rendered by B readable via A', pvM.status === 200 && pvM.headers['content-type'] === 'image/png', `got ${pvM.status}`);
+
+    // ...process on A, then read job/verification state from B.
+    const prM = await lb((p) => processDoc(S, docM, { selectedCandidateIds: [candM] }, p));
+    check('M06 process via instance A → terminal state', prM.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prM.json?.document?.status), `got ${prM.status} ${JSON.stringify(prM.json).slice(0, 120)}`);
+    const jobM = prM.json?.job?.id;
+    const jobOnB = await lb((p) => api(S, 'GET', `/jobs/${jobM}`, {}, p));
+    check('M07 job written by A readable via B', jobOnB.status === 200 && !!jobOnB.json?.job?.id, `got ${jobOnB.status}`);
+
+    // ...download from B (output written by A on the shared root).
+    const dlM = await lb((p) => download(S, docM, p));
+    check('M08 download via instance B streams the output A wrote', dlM.status === 200 && dlM.body.subarray(0, 5).toString('ascii') === '%PDF-', `got ${dlM.status}`);
+
+    // IDOR must hold across instances too.
+    const X = newSession();
+    check('M09 foreign session on instance A cannot read doc (written via B path)', (await getDoc(X, docM, portA)).status === 404);
+    check('M10 foreign session on instance B cannot download', (await download(X, docM, portB)).status === 404);
+
+    // Cross-instance duplicate-processing race: fresh doc, two claims racing.
+    const upM2 = await lb((p) => createSample(S, 'draft', p));
+    const docM2: string = upM2.json?.document?.id ?? '';
+    await lb((p) => analyze(S, docM2, p));
+    const candM2 = (await getAnalysis(S, docM2, portA)).json.analysis.candidates[0].id;
+    // Fire both claims simultaneously at different instances.
+    const [racA, racB] = await Promise.all([
+      processDoc(S, docM2, { selectedCandidateIds: [candM2] }, portA),
+      processDoc(S, docM2, { selectedCandidateIds: [candM2] }, portB),
+    ]);
+    const raceCodes = [racA.status, racB.status].sort().join(',');
+    check('M11 cross-instance race: one 200 + one 409 (never double success)', ['200,409'].includes(raceCodes), raceCodes);
+    const docM2After = (await getDoc(S, docM2, portA)).json?.document?.status;
+    check('M12 coherent terminal state after cross-instance race', ['COMPLETED', 'REVIEW_REQUIRED'].includes(docM2After), docM2After);
+    const outputsM2 = fs
+      .readdirSync(path.join(sharedStorage, S, 'output'))
+      .filter((f) => f.startsWith(`cleaned_${docM2}`));
+    check('M13 exactly one output artifact in shared storage', outputsM2.length === 1, outputsM2.join(','));
+
+    // Cross-instance 409 check: the loser's answer must be INVALID_STATE.
+    check(
+      'M14 loser reports INVALID_STATE (honest 409, not a 500)',
+      (racA.status === 409 || racB.status === 409) &&
+        [racA, racB].find((r) => r.status === 409)?.json?.error?.code === 'INVALID_STATE'
+    );
+
+    console.log('');
+  } catch (err) {
+    console.error('\nE2E fatal error (multi-instance phase):', err);
+    failed++;
+    throw err;
+  } finally {
+    await stopServer(instA.child);
+    await stopServer(instB.child);
+    try {
+      fs.rmSync(sharedDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
 async function main(): Promise<void> {
   // Phase 1: core checklist on default configuration.
   const core = await bootServer({});
@@ -582,6 +698,9 @@ async function main(): Promise<void> {
   } finally {
     await stopServer(gate.child);
   }
+
+  // Phase 4: two instances sharing SQLite + storage root (V2 topology).
+  await runMultiInstanceChecks();
 
   console.log('\n==========================================================');
   console.log(`  E2E RESULT: ${passed} passed, ${failed} failed (${passed + failed} checks)`);

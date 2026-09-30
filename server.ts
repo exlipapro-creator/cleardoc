@@ -9,6 +9,7 @@ import fs from 'fs';
 import { CONFIG } from './server/config.js';
 import { apiRouter } from './server/routes.js';
 import { startCleanupWorker } from './server/cleanup.js';
+import { getMetadataBackendKind } from './server/db.js';
 
 async function bootstrap() {
   const app = express();
@@ -40,6 +41,8 @@ async function bootstrap() {
       service: 'cleardoc-engine',
       version: '1.0.0',
       engines: CONFIG.ENGINE_VERSIONS,
+      metadata: getMetadataBackendKind(),
+      multiInstance: CONFIG.SHARED_DB_PATH ? true : false,
       timestamp: new Date().toISOString(),
     });
   });

@@ -1,12 +1,33 @@
 # ClearDoc Deployment
 
-## Supported topology (V1)
+## Supported topologies
 
-**Exactly one server process per storage directory.** Metadata is in-memory and
-files are local — there is no shared store. Do not run two instances against the
-same `storage/` path, and do not put multiple instances behind one load balancer
-without session affinity *and* separate storage roots (which changes behavior —
-not supported in V1).
+### Single instance (default)
+
+One server process, in-memory metadata, local temp files. No configuration
+needed.
+
+### Two or more instances behind a load balancer (opt-in V2)
+
+All instances must share:
+
+```bash
+CLEARDOC_SHARED_DB_PATH=/var/lib/cleardoc/shared.db      # SQLite (node:sqlite, WAL)
+CLEARDOC_SHARED_STORAGE_ROOT=/var/lib/cleardoc/storage   # shared volume for session files
+```
+
+- Both variables are required together; setting only one fails fast at boot.
+- The SQLite DB file must live on storage with correct POSIX locking: a local
+  disk or network **block** volume. NFS/SMB/general network file shares are
+  explicitly unsupported for the DB. If you containerize: keep the DB on the
+  instance's local disk or an RWO block volume, and use a shared RWX volume
+  only for `CLEARDOC_SHARED_STORAGE_ROOT`.
+- Session affinity is NOT required; any instance can serve any request
+  (verified by E2E phase 4, checks M01–M14, including a cross-instance
+  double-process race that yields exactly one 200 + one 409).
+- GC runs independently in every instance against the shared DB and storage —
+  it is idempotent and safe to run concurrently.
+- Retention semantics are unchanged: 1 h temp files, purge on expiry.
 
 ## Build & run
 
@@ -78,8 +99,10 @@ ReadWritePaths=/opt/cleardoc/storage
 WantedBy=multi-user.target
 ```
 
-## Not provided in V1
+## Not provided
 
 - Docker images / compose files (none exist in the repo — do not assume one).
-- Horizontal scaling, queues, external databases, object storage.
+- More than shared-file SQLite: no Postgres/Redis queue, no object storage.
 - Metrics/tracing endpoints; logs are structured console output only.
+- Active-active across machines with SQLite over NFS — explicitly unsupported;
+  keep `CLEARDOC_SHARED_DB_PATH` on local/block storage.

@@ -24,7 +24,8 @@ Express (server.ts)
 | `server.ts` | Bootstrap, security headers, `/health`, `/ready`, static serving, `unhandledRejection` handler |
 | `server/routes.ts` | All API orchestration: upload validation, analysis, processing pipeline, verification gating, downloads, fixtures endpoint, multer error handler |
 | `server/config.ts` | Environment-driven limits (size, pages, retention, DPI), storage paths, engine versions |
-| `server/db.ts` | In-memory metadata store with **enforced state machine** — illegal transitions are rejected (return `null`), never just logged |
+| `server/db.ts` | Metadata store facade — selects the backend from config; **enforced state machine** (illegal transitions return `null`, never just logged) |
+| `server/persist.ts` | Interchangeable backends: `MemoryBackend` (per-process Maps, V1 default) and `SqliteBackend` (shared SQLite via `node:sqlite`, WAL, CAS state transitions for multi-instance safety) |
 | `server/storage.ts` | Session-scoped temp directories (`original/ working/ output/ previews/`), magic-byte validation, retention-based GC |
 | `server/cleanup.ts` | Periodic GC worker + startup sweep for orphaned sessions |
 | `server/fixtures.ts` | Real sample-document generators (PDF via pdf-lib, PNG via SVG→sharp) used by the `/api/fixtures/create-sample` endpoint |
@@ -62,9 +63,20 @@ the deadline fires during verification — the legal failure state for that stag
 instead of hanging the worker. Raster ingest is additionally bounded by a
 decoded-pixel ceiling (`CLEARDOC_MAX_IMAGE_PIXELS`).
 
-## Persistence decision (explicit, V1)
+## Persistence (explicit)
 
-Single-instance, in-memory metadata + local temp files. Rationale: V1 is a
-temporary-processing service with automatic purge; no durable document store is
-required by the product specification. Consequences are documented in the README
-and `docs/deployment.md`. Do not scale horizontally with this architecture.
+**Default (single instance):** in-memory metadata + local temp files. V1 is a
+temporary-processing service with automatic purge; no durable store required.
+Consequences are documented in the README and `docs/deployment.md`.
+
+**Opt-in multi-instance (V2):** set `CLEARDOC_SHARED_DB_PATH` (SQLite via
+`node:sqlite`, WAL, `busy_timeout`) **and** `CLEARDOC_SHARED_STORAGE_ROOT`
+(shared volume). Both instances then read/write the same metadata and serve the
+same session file tree. Cross-instance double-processing is prevented by an
+atomic compare-and-set claim (`claimDocument`: `UPDATE … WHERE id = ? AND
+status = ?` against the status the caller observed) — exactly one instance can
+win a `AWAITING_REVIEW → PROCESSING` race; the loser reports 409. All of this
+is verified by E2E phase 4 (checks M01–M14: shared visibility, cross-instance
+download, IDOR across instances, race mutual exclusion, single artifact).
+
+Fail-fast: configuring only one of the two shared variables refuses to boot.

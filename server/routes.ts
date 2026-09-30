@@ -512,8 +512,10 @@ apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Pr
     jobId = `job_${uuidv4()}`;
 
     // Claim the document atomically BEFORE registering the job so a losing
-    // concurrent request cannot leave an orphaned RUNNING job behind.
-    if (!db.updateDocumentStatus(id, 'PROCESSING', { lastJobId: jobId })) {
+    // concurrent request cannot leave an orphaned RUNNING job behind. The
+    // claim CAS-checks the status this request observed, so behind a load
+    // balancer exactly one instance can win — the loser reports 409.
+    if (!db.claimDocument(id, doc.status, 'PROCESSING', { lastJobId: jobId })) {
       res.status(409).json({
         error: { code: 'INVALID_STATE', message: 'Document cannot be processed in its current state.' },
       });

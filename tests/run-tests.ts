@@ -5,6 +5,7 @@
  */
 import assert from 'assert';
 import fs from 'fs';
+import path from 'path';
 import { storageService } from '../server/storage.js';
 import {
   generateDraftPdfFixture,
@@ -21,7 +22,7 @@ import { detectRasterWatermarks } from '../server/rasterEngine/detector.js';
 import { processRasterWatermark } from '../server/rasterEngine/processor.js';
 import { verifyProcessedRaster } from '../server/rasterEngine/verifier.js';
 import { db } from '../server/db.js';
-import { DocumentRecord } from '../shared/types.js';
+import { DocumentRecord, AnalysisRecord } from '../shared/types.js';
 
 let passed = 0;
 let failed = 0;
@@ -331,6 +332,98 @@ async function runTestSuite() {
     const secondPass = db.cleanupExpired();
     assert.strictEqual(secondPass, 0, 'second GC pass removes nothing new and does not throw');
     assert.strictEqual(fs.existsSync(paths.sessionDir), false);
+  });
+
+  await test('SQLite backend: cross-instance semantics (visibility, CAS race, cleanup)', async () => {
+    const { SqliteBackend } = await import('../server/persist.js');
+    const os = await import('os');
+    const dbPath = path.join(os.tmpdir(), `cleardoc-test-${Date.now()}-${process.pid}.db`);
+    let A: any = null;
+    let B: any = null;
+    try {
+      A = new SqliteBackend(dbPath); // "instance A"
+      B = new SqliteBackend(dbPath); // "instance B", same shared DB
+
+      const mk = (id: string): DocumentRecord => ({
+        id,
+        sessionId: 'sqlite_sess_01',
+        originalFilename: 't.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 1,
+        sha256: 'x',
+        pageCount: 1,
+        dimensions: [{ width: 595, height: 842 }],
+        status: 'UPLOADED',
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+      // Instance A saves; instance B must see it immediately.
+      A.saveDocument(mk('docX'));
+      assert.ok(B.getDocument('docX', 'sqlite_sess_01'), 'cross-instance visibility');
+
+      // Advance to AWAITING_REVIEW so the next step is the real processing claim.
+      A.updateDocumentStatus('docX', 'ANALYZING');
+      A.updateDocumentStatus('docX', 'AWAITING_REVIEW');
+      assert.strictEqual(B.getDocument('docX')?.status, 'AWAITING_REVIEW', 'transitions visible cross-instance');
+
+      // Cross-instance CAS race: both instances observed AWAITING_REVIEW and
+      // both try to claim PROCESSING via the atomic claim primitive.
+      // Exactly one CAS may win.
+      const aWon = A.claimDocument('docX', 'AWAITING_REVIEW', 'PROCESSING') !== null;
+      const bWon = B.claimDocument('docX', 'AWAITING_REVIEW', 'PROCESSING') !== null;
+      assert.ok(aWon !== bWon, `exactly one instance wins the race (a=${aWon} b=${bWon})`);
+
+      // Illegal transition still rejected in shared mode.
+      assert.strictEqual(
+        B.updateDocumentStatus('docX', 'COMPLETED'),
+        null,
+        'illegal transition rejected across instances'
+      );
+
+      // Retry from failed state is legal and visible to the other instance.
+      assert.ok(B.updateDocumentStatus('docX', 'PROCESSING_FAILED') !== null);
+      assert.ok(A.updateDocumentStatus('docX', 'PROCESSING') !== null, 'retry visible cross-instance');
+
+      // Analyses: replace-on-save, visible cross-instance.
+      const analysis: AnalysisRecord = {
+        id: 'analysisX',
+        documentId: 'docX',
+        engineVersion: 't',
+        analysisHash: 'h',
+        candidates: [],
+        pageCount: 1,
+        hasNativeContent: true,
+        isRasterOnly: false,
+        summary: '',
+        createdAt: new Date().toISOString(),
+      };
+      A.saveAnalysis(analysis);
+      assert.ok(B.getAnalysisByDocumentId('docX'), 'analysis visible cross-instance');
+      A.saveAnalysis({ ...analysis, id: 'analysisX2' });
+      assert.strictEqual(B.getAnalysisByDocumentId('docX')?.id, 'analysisX2', 'analysis replaced, single row');
+
+      // Jobs + verifications cross-instance.
+      A.saveJob({ id: 'jobX', documentId: 'docX', strategy: 'NATIVE_OBJECT_REMOVAL', engineVersion: 't', status: 'RUNNING', step: 'S', progressPercentage: 1, startedAt: new Date().toISOString() });
+      assert.ok(B.getJob('jobX', 'sqlite_sess_01'), 'job session-scoped cross-instance');
+      assert.strictEqual(B.getJob('jobX', 'other_session_xx'), null, 'foreign session job = null');
+
+      // Expiry cleanup works on shared data and is idempotent.
+      const expired = { ...mk('docY'), expiresAt: new Date(Date.now() - 1000).toISOString() };
+      B.saveDocument(expired);
+      assert.ok(A.cleanupExpired() >= 1, 'expired doc purged via shared DB');
+      assert.strictEqual(A.getDocument('docY'), null);
+      A.cleanupExpired(); // idempotent second pass
+
+    } finally {
+      // Release DB handles BEFORE removing files (Windows locks open files).
+      // Lives in finally so assertion failures surface instead of masking as EBUSY.
+      A.close?.();
+      B.close?.();
+      for (const suffix of ['', '-wal', '-shm']) {
+        fs.rmSync(dbPath + suffix, { force: true });
+      }
+    }
   });
 
   if (failed > 0) {
