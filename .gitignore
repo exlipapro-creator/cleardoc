@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build output
+build/
+dist/
+
+# coverage
+coverage/
+
+# ClearDoc temporary document storage (privacy: never commit user documents)
+storage/temp/
+
+# environment (keep the template)
+.env*
+!.env.example
+
+# logs and OS junk
+*.log
+.DS_Store
+
+# editor
+.idea/
+.vscode/
+*.swp
