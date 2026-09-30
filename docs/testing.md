@@ -6,8 +6,8 @@
 |---|---|---|
 | `npm run lint` | `tsc --noEmit` over the whole project (strict) | PASS |
 | `npm test` | 12 unit/integration tests via `tests/run-tests.ts` | 12/12 PASS |
-| `npm run test:e2e` | 54-check live E2E (`tests/e2e.ts`), boots a real dev server on an ephemeral port | 54/54 PASS |
-| `BUILD=prod npm run test:e2e` | The same 54 checks against `dist/server.js` + built SPA (production mode) | 54/54 PASS |
+| `npm run test:e2e` | 70-check live E2E (`tests/e2e.ts`), boots a real dev server on an ephemeral port | 70/70 PASS |
+| `BUILD=prod npm run test:e2e` | The same 70 checks against `dist/server.js` + built SPA (production mode) | 70/70 PASS |
 
 `npm ci && npm run build && npm test` is the reproducible clean-build gate;
 `npm install` works without `--legacy-peer-deps` (dependency tree aligned: esbuild
@@ -32,7 +32,9 @@
 ## E2E checklist (`tests/e2e.ts`)
 
 The authoritative release gate. Boots its own server (ephemeral port, tsx dev or
-`node dist/server.js` for `BUILD=prod`), then verifies over live HTTP:
+`node dist/server.js` for `BUILD=prod`) in **three phases**:
+
+**Phase 1 — core checklist (default config):**
 
 - `/health`, `/ready`, security headers, session bootstrap
 - PDF happy path: sample → upload → analyze → candidate geometry → process →
@@ -48,6 +50,20 @@ The authoritative release gate. Boots its own server (ephemeral port, tsx dev or
   PDF manual regions → 400 `MANUAL_REGIONS_UNSUPPORTED`
 - Failure paths: unknown document/job 404s, process without selection
 - Rate limiting: burst → 429; no bypass across endpoints
+
+**Phase 2 — resource exhaustion (1.5s processing deadline):**
+
+- 31 MB upload → honest 413; 51-page PDF → 400 `PAGE_LIMIT_EXCEEDED`
+- 50-page watermarked PDF under deadline → 5xx `PROCESSING_FAILED`, retryable
+  state, elapsed bounded, server survives
+- 17.5MP raster: ingest + analysis bounded; processing resolves coherently
+- 54MP raster → 413 `IMAGE_TOO_LARGE` (decoded-pixel ceiling)
+- 41MP legal raster: ingest + analysis complete within bounds
+
+**Phase 3 — deterministic deadline gate (1ms deadline):**
+
+- Raster path under an expired deadline → 5xx `PROCESSING_FAILED`, retryable
+  failure state (never a stuck `VERIFYING` or false `COMPLETED`), server healthy
 
 Exit code 0 only when every check passes — wire it into CI as the release gate.
 

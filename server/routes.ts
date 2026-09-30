@@ -116,6 +116,12 @@ function mapUploadError(err: Error): { status: number; code: string; message: st
         code: 'FILE_TOO_LARGE',
         message: `File exceeds the maximum size of ${Math.round(CONFIG.MAX_FILE_SIZE_BYTES / (1024 * 1024))} MB.`,
       };
+    case 'IMAGE_TOO_LARGE':
+      return {
+        status: 413,
+        code: 'IMAGE_TOO_LARGE',
+        message: `Image exceeds the maximum resolution of ${Math.round(CONFIG.MAX_IMAGE_PIXELS / 1e6)} megapixels.`,
+      };
     case 'UNSUPPORTED_FORMAT':
       return {
         status: 415,
@@ -172,6 +178,20 @@ async function ingestDocument(
   } else {
     const meta = await sharp(buffer).metadata();
     dimensions = [{ width: meta.width || 800, height: meta.height || 600 }];
+
+    // Raster resource control: reject images whose decoded pixel count exceeds
+    // the configured ceiling. This bounds analysis/processing memory+CPU at the
+    // front door instead of relying on the processing deadline alone.
+    const decodedPixels = (meta.width || 0) * (meta.height || 0);
+    if (decodedPixels > CONFIG.MAX_IMAGE_PIXELS) {
+      await storageService.deleteSession(sessionId).catch(() => undefined);
+      const err: any = new Error(
+        `Image is ${meta.width}x${meta.height} (${Math.round(decodedPixels / 1e6)} MP). Maximum is ${Math.round(CONFIG.MAX_IMAGE_PIXELS / 1e6)} MP.`
+      );
+      err.code = 'IMAGE_TOO_LARGE';
+      err.status = 413;
+      throw err;
+    }
 
     const previewBuffer = await sharp(buffer).png().toBuffer();
     await fs.promises.writeFile(path.join(paths.previewsDir, `orig_p1.png`), previewBuffer);
@@ -524,7 +544,7 @@ apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Pr
     // The race rejection is asynchronous (PDF/JS engines cannot be preempted
     // mid-parse), so the HTTP client may see a timeout first — either way the job
     // ends FAILED and the document is never left in a false COMPLETED state.
-    const PROCESSING_DEADLINE_MS = 120_000;
+    const PROCESSING_DEADLINE_MS = CONFIG.PROCESSING_DEADLINE_MS;
     const deadlineAt = Date.now() + PROCESSING_DEADLINE_MS;
 
     let cleanedBuffer: Buffer;
@@ -678,7 +698,12 @@ apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Pr
       });
     }
     if (documentId) {
-      db.updateDocumentStatus(documentId, 'PROCESSING_FAILED', { errorMessage: err.message });
+      // Use the legal failure state for wherever the pipeline was when it threw:
+      // VERIFYING may only transition to VERIFICATION_FAILED; anything earlier
+      // maps to PROCESSING_FAILED. Both remain retryable.
+      const failureState =
+        db.getDocument(documentId)?.status === 'VERIFYING' ? 'VERIFICATION_FAILED' : 'PROCESSING_FAILED';
+      db.updateDocumentStatus(documentId, failureState, { errorMessage: err.message });
     }
     res.status(500).json({
       error: {

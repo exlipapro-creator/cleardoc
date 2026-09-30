@@ -11,7 +11,7 @@ ClearDoc never confuses *"the processing function returned successfully"* with
 
 ## What it does
 
-1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages).
+1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 50 megapixels for raster images).
 2. **Analyze** — real structural inspection (PDF text items, fonts, images) or real
    pixel-level background-deviation analysis (raster images). A document with no
    watermark gets **zero candidates**, honestly.
@@ -63,14 +63,17 @@ npm run dev        # tsx server.ts → http://localhost:3000 (Vite middleware, H
 ```bash
 npm run lint       # TypeScript, strict, whole project
 npm test           # 12 unit/integration tests (engines, detector honesty, GC, state machine)
-npm run test:e2e   # 54-check live E2E: boots a real server, full release checklist
-BUILD=prod npm run test:e2e   # same 54 checks against the production build artifacts
+npm run test:e2e   # 70-check live E2E: boots a real server, full release checklist
+BUILD=prod npm run test:e2e   # same 70 checks against the production build artifacts
 ```
 
 The E2E suite covers: happy paths (PDF + raster), IDOR/cross-session access,
 path traversal, upload validation (fake/renamed/corrupt/truncated/empty files),
 state-machine gates, duplicate-processing race, manual raster regions, download
-gating, failure paths and rate limiting.
+gating, failure paths, rate limiting — plus a resource-exhaustion phase
+(oversized upload, over-limit page count, over-limit image resolution, and a
+deterministic processing-deadline cut-off asserting PROCESSING_FAILED with the
+server surviving).
 
 ## Production deployment
 

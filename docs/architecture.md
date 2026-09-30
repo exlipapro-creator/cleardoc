@@ -55,9 +55,12 @@ COMPLETED, EXPIRED, DELETED: no outgoing transitions.
 ## Processing deadline
 
 Every engine call inside `/process` (`executeNativeRemoval`, `verifyProcessedPdf`,
-`processRasterWatermark`, `verifyProcessedRaster`) runs under a 120 s
-`withDeadline` race. A pathological document produces `PROCESSING_FAILED` instead
-of hanging the worker.
+`processRasterWatermark`, `verifyProcessedRaster`) runs under a configurable
+`withDeadline` race (default 120 s, `CLEARDOC_PROCESSING_DEADLINE_MS`). A
+pathological document produces `PROCESSING_FAILED` (or `VERIFICATION_FAILED` if
+the deadline fires during verification — the legal failure state for that stage)
+instead of hanging the worker. Raster ingest is additionally bounded by a
+decoded-pixel ceiling (`CLEARDOC_MAX_IMAGE_PIXELS`).
 
 ## Persistence decision (explicit, V1)
 

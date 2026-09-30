@@ -19,6 +19,8 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import sharp from 'sharp';
 
 const IS_PROD = process.env.BUILD === 'prod';
 const FIXED_PORT = parseInt(process.env.E2E_PORT || '', 10) || 0;
@@ -173,32 +175,84 @@ async function processDoc(s: string, id: string, body: any = {}): Promise<ApiRes
   return api(s, 'POST', `/documents/${id}/process`, { json: body });
 }
 
+/**
+ * Hostile fixture: a real (parseable) PDF with `pages` pages — used to hit the
+ * page limit at ingest and to stress the native removal pipeline.
+ */
+async function generateManyPagePdf(pages: number): Promise<Buffer> {
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  for (let i = 0; i < pages; i++) {
+    const page = pdf.addPage([595, 842]);
+    page.drawText(`Hostile fixture page ${i + 1} of ${pages}`, {
+      x: 72,
+      y: 770,
+      size: 12,
+      font,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+    // Diagonal oversized watermark text on every page (removal target).
+    page.drawText('DRAFT', {
+      x: 140,
+      y: 400,
+      size: 90,
+      font,
+      color: rgb(0.9, 0.2, 0.2),
+      opacity: 0.25,
+      rotate: { type: 'degrees', value: -30 } as any,
+    });
+  }
+  return Buffer.from(await pdf.save());
+}
+
+/**
+ * Hostile fixture: high-resolution raster image (w × h) with a red stamp box
+ * near the center — stresses raster analysis/processing memory and CPU.
+ */
+async function generateHighResRaster(w: number, h: number): Promise<Buffer> {
+  const stampW = Math.round(w * 0.4);
+  const stampH = Math.round(h * 0.2);
+  const x0 = Math.round(w / 2 - stampW / 2);
+  const y0 = Math.round(h / 2 - stampH / 2);
+  const svg = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="${w}" height="${h}" fill="#f4f5f7"/>
+    <rect x="${x0}" y="${y0}" width="${stampW}" height="${stampH}" fill="none" stroke="#d33" stroke-width="14" stroke-opacity="0.75"/>
+    <text x="${w / 2}" y="${y0 + stampH / 2}" font-family="Arial" font-size="${Math.round(stampH * 0.5)}" font-weight="bold" fill="#d33" fill-opacity="0.75" text-anchor="middle" dominant-baseline="middle">SPECIMEN</text>
+  </svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
 // ---------------------------------------------------------------------------
 // Main checklist
 // ---------------------------------------------------------------------------
-async function main(): Promise<void> {
+async function bootServer(
+  envExtra: Record<string, string>
+): Promise<{ child: ChildProcess; log: { text: string } }> {
   PORT = await pickFreePort();
-  console.log(`\n=== ClearDoc E2E — ${IS_PROD ? 'PRODUCTION build' : 'dev (tsx)'} — port ${PORT} ===\n`);
+  console.log(`\n=== ClearDoc E2E phase — ${IS_PROD ? 'PRODUCTION build' : 'dev (tsx)'} — port ${PORT} ===\n`);
 
   const tsxCli = path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
   const serverArgs = IS_PROD ? [path.join(ROOT, 'dist', 'server.js')] : [tsxCli, 'server.ts'];
-  const server = spawn(process.execPath, serverArgs, {
+  const child = spawn(process.execPath, serverArgs, {
     cwd: ROOT,
     env: {
       ...process.env,
       PORT: String(PORT),
       NODE_ENV: IS_PROD ? 'production' : 'development',
       ...(IS_PROD ? {} : { DISABLE_HMR: 'true' }),
+      ...envExtra,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let serverLog = '';
-  server.stdout.on('data', (d) => (serverLog += d.toString()));
-  server.stderr.on('data', (d) => (serverLog += d.toString()));
+  const log = { text: '' };
+  child.stdout.on('data', (d) => (log.text += d.toString()));
+  child.stderr.on('data', (d) => (log.text += d.toString()));
+  await waitHealthy();
+  return { child, log };
+}
 
+async function runCoreChecks(): Promise<void> {
   try {
-    await waitHealthy();
-
     // ---- Infrastructure ----
     const health = await fetch(`http://127.0.0.1:${PORT}/health`);
     const healthBody = await health.json();
@@ -367,22 +421,176 @@ async function main(): Promise<void> {
     const sessions = fs.existsSync(storageRoot) ? fs.readdirSync(storageRoot) : [];
     check('50 storage holds only session-scoped dirs (UUID-like)', sessions.every((s) => /^[a-zA-Z0-9_-]{10,64}$/.test(s)), sessions.slice(0, 5).join(','));
 
-    console.log('\n==========================================================');
-    console.log(`  E2E RESULT: ${passed} passed, ${failed} failed (${passed + failed} checks)`);
-    console.log('==========================================================');
-    if (failures.length) {
-      console.log('\nFailures:');
-      failures.forEach((f) => console.log(`  ${f}`));
-    }
     console.log('');
   } catch (err) {
-    console.error('\nE2E fatal error:', err);
-    console.error('--- server log tail ---\n' + serverLog.slice(-2000));
+    console.error('\nE2E fatal error (core phase):', err);
     failed++;
+    throw err;
+  }
+}
+
+/**
+ * Hostile phase: resource-exhaustion resistance.
+ * Runs on a second server boot configured with a 1.5s processing deadline so
+ * the deadline mechanism is exercised for real (the production default is 120s).
+ * Asserts pathological documents end FAILED — never a false COMPLETED — and
+ * that the server survives to serve healthy traffic afterwards.
+ */
+async function runHostileChecks(): Promise<void> {
+  try {
+    const H = newSession();
+
+    // --- Ingest-limit hostiles (fast rejections at the front door) ---
+    const oversized = Buffer.concat([
+      Buffer.from('%PDF-1.4\n'),
+      crypto.randomBytes(31 * 1024 * 1024),
+    ]);
+    const upBig = await upload(H, 'hostile_oversized.pdf', oversized);
+    check('R01 31MB oversized upload → 413 (not 500)', upBig.status === 413, `got ${upBig.status}`);
+
+    const manyPagePdf = await generateManyPagePdf(51);
+    const upPages = await upload(H, 'hostile_51pages.pdf', manyPagePdf);
+    check('R02 51-page PDF rejected at ingest → 400 PAGE_LIMIT_EXCEEDED', upPages.status === 400 && upPages.json?.error?.code === 'PAGE_LIMIT_EXCEEDED', `got ${upPages.status} ${JSON.stringify(upPages.json).slice(0, 120)}`);
+
+    // --- Deadline hostiles (tiny CLEARDOC_PROCESSING_DEADLINE_MS on this boot) ---
+    const upH1 = await createSample(H, 'draft');
+    const docH1: string = upH1.json?.document?.id ?? '';
+    await analyze(H, docH1);
+    const candH1 = (await getAnalysis(H, docH1)).json.analysis.candidates[0].id;
+    const t0 = Date.now();
+    const prH1 = await processDoc(H, docH1, { selectedCandidateIds: [candH1] });
+    const elapsed1 = Date.now() - t0;
+    check(
+      'R03 deadline fires on 50-page PDF → 5xx PROCESSING_FAILED (no hang, no crash)',
+      prH1.status >= 500 && prH1.json?.error?.code === 'PROCESSING_FAILED' && elapsed1 < 15000,
+      `status=${prH1.status} code=${prH1.json?.error?.code} elapsed=${elapsed1}ms`
+    );
+    const docH1After = (await getDoc(H, docH1)).json?.document?.status;
+    check(
+      'R04 50-page PDF lands in a retryable FAILED state (never VERIFYING/PROCESSING)',
+      ['PROCESSING_FAILED', 'VERIFICATION_FAILED'].includes(docH1After),
+      `status=${docH1After}`
+    );
+
+    const bigRaster = await generateHighResRaster(5000, 3500);
+    const upH2 = await upload(H, 'hostile_hires.png', bigRaster);
+    check('R05 17.5MP raster accepted (under the 50MP ceiling)', upH2.status === 201, `got ${upH2.status} ${JSON.stringify(upH2.json).slice(0, 120)}`);
+    const anH2 = await analyze(H, upH2.json.document.id);
+    check('R06 17.5MP raster analysis completes (bounded ingest)', anH2.status === 200, `got ${anH2.status}`);
+    const candH2 = anH2.json?.analysis?.candidates?.[0]?.id;
+    const prH2 = await processDoc(H, upH2.json.document.id, candH2 ? { selectedCandidateIds: [candH2] } : { manualRegions: [{ id: 'mr_h', page: 1, bbox: { x: 100, y: 100, width: 800, height: 600 } }] });
+    check(
+      'R07 17.5MP raster resolves coherently under deadline (completed or failed, never hangs)',
+      (prH2.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prH2.json?.document?.status)) ||
+        (prH2.status >= 500 && prH2.json?.error?.code === 'PROCESSING_FAILED'),
+      `status=${prH2.status} code=${prH2.json?.error?.code} doc=${prH2.json?.document?.status}`
+    );
+    const docH2After = (await getDoc(H, upH2.json.document.id)).json?.document?.status;
+    check(
+      'R08 17.5MP raster ends in a coherent terminal state (no stuck VERIFYING)',
+      ['COMPLETED', 'REVIEW_REQUIRED', 'PROCESSING_FAILED', 'VERIFICATION_FAILED'].includes(docH2After),
+      `status=${docH2After}`
+    );
+
+    // Raster over the decoded-pixel ceiling: rejected at ingest with
+    // IMAGE_TOO_LARGE (raster resource control), never processed.
+    const hugeRaster = await generateHighResRaster(9000, 6000); // 54 MP > 50 MP
+    const upH3 = await upload(H, 'hostile_huge.png', hugeRaster);
+    check('R11 54MP raster rejected at ingest → 413 IMAGE_TOO_LARGE', upH3.status === 413 && upH3.json?.error?.code === 'IMAGE_TOO_LARGE', `got ${upH3.status} ${JSON.stringify(upH3.json).slice(0, 140)}`);
+
+    // Legal but heavy raster: ingest and analysis must stay bounded (no crash,
+    // no unbounded work). Whether processing then finishes inside this phase's
+    // 1.5s deadline is machine-dependent, so the deterministic raster deadline
+    // proof lives in the 1ms-deadline phase (runDeadlineGateChecks).
+    const heavyRaster = await generateHighResRaster(6800, 6000); // ~41 MP, legal
+    const upH4 = await upload(H, 'hostile_heavy.png', heavyRaster);
+    check('R12 41MP raster accepted at ingest (under pixel ceiling)', upH4.status === 201, `got ${upH4.status}`);
+    const anH4 = await analyze(H, upH4.json.document.id);
+    check('R13 41MP raster analysis completes within bounds', anH4.status === 200, `got ${anH4.status}`);
+
+    // --- Server must still be alive and fully functional ---
+    const post = await createSample(H, 'clean');
+    check('R09 server healthy after hostile phase (still accepts work)', post.status === 201, `got ${post.status}`);
+    const healthAfter = await fetch(`http://127.0.0.1:${PORT}/health`);
+    check('R10 /health still ok after hostiles', healthAfter.ok);
+
+    console.log('');
+  } catch (err) {
+    console.error('\nE2E fatal error (hostile phase):', err);
+    failed++;
+    throw err;
+  }
+}
+
+/**
+ * Deadline-gate phase: boots with CLEARDOC_PROCESSING_DEADLINE_MS=1 so
+ * withDeadline rejects synchronously before any engine work starts. This
+ * deterministically proves the raster path's deadline gate and failure-state
+ * mapping (the PDF-path equivalent under real load is R03's 1.5s cut-off).
+ */
+async function runDeadlineGateChecks(): Promise<void> {
+  try {
+    const D = newSession();
+    const upD = await createSample(D, 'image');
+    const docD: string = upD.json?.document?.id ?? '';
+    const anD = await analyze(D, docD);
+    const candD = anD.json?.analysis?.candidates?.[0]?.id;
+    const prD = await processDoc(D, docD, candD ? { selectedCandidateIds: [candD] } : { manualRegions: [{ id: 'mr_d', page: 1, bbox: { x: 200, y: 200, width: 300, height: 200 } }] });
+    check(
+      'R14 raster path under expired deadline → 5xx PROCESSING_FAILED (deterministic)',
+      prD.status >= 500 && prD.json?.error?.code === 'PROCESSING_FAILED',
+      `status=${prD.status} code=${prD.json?.error?.code}`
+    );
+    const docDAfter = (await getDoc(D, docD)).json?.document?.status;
+    check(
+      'R15 raster doc lands in a retryable FAILED state (no stuck VERIFYING)',
+      ['PROCESSING_FAILED', 'VERIFICATION_FAILED'].includes(docDAfter),
+      `status=${docDAfter}`
+    );
+    const healthD = await fetch(`http://127.0.0.1:${PORT}/health`);
+    check('R16 server healthy after deadline-gate checks', healthD.ok);
+
+    console.log('');
+  } catch (err) {
+    console.error('\nE2E fatal error (deadline-gate phase):', err);
+    failed++;
+    throw err;
+  }
+}
+
+async function main(): Promise<void> {
+  // Phase 1: core checklist on default configuration.
+  const core = await bootServer({});
+  try {
+    await runCoreChecks();
   } finally {
-    await stopServer(server);
+    await stopServer(core.child);
   }
 
+  // Phase 2: resource-exhaustion hostiles with a 1.5s processing deadline.
+  const hostile = await bootServer({ CLEARDOC_PROCESSING_DEADLINE_MS: '1500' });
+  try {
+    await runHostileChecks();
+  } finally {
+    await stopServer(hostile.child);
+  }
+
+  // Phase 3: deterministic raster deadline gate with an expired (1ms) deadline.
+  const gate = await bootServer({ CLEARDOC_PROCESSING_DEADLINE_MS: '1' });
+  try {
+    await runDeadlineGateChecks();
+  } finally {
+    await stopServer(gate.child);
+  }
+
+  console.log('\n==========================================================');
+  console.log(`  E2E RESULT: ${passed} passed, ${failed} failed (${passed + failed} checks)`);
+  console.log('==========================================================');
+  if (failures.length) {
+    console.log('\nFailures:');
+    failures.forEach((f) => console.log(`  ${f}`));
+  }
+  console.log('');
   process.exit(failed === 0 ? 0 : 1);
 }
 

@@ -14,8 +14,10 @@ export const CONFIG = {
   // Storage & Limits
   MAX_FILE_SIZE_BYTES: parseInt(process.env.CLEARDOC_MAX_FILE_SIZE_BYTES || '31457280', 10), // 30 MB
   MAX_PAGE_COUNT: parseInt(process.env.CLEARDOC_MAX_PAGE_COUNT || '50', 10),
+  MAX_IMAGE_PIXELS: parseInt(process.env.CLEARDOC_MAX_IMAGE_PIXELS || '50000000', 10), // 50 MP decoded-pixel ceiling for raster images
   RETENTION_MS: parseInt(process.env.CLEARDOC_RETENTION_MS || '3600000', 10), // 1 hour
   CLEANUP_INTERVAL_MS: parseInt(process.env.CLEARDOC_CLEANUP_INTERVAL_MS || '300000', 10), // 5 min
+  PROCESSING_DEADLINE_MS: parseInt(process.env.CLEARDOC_PROCESSING_DEADLINE_MS || '120000', 10), // per-stage processing deadline
   
   // Rendering DPI
   THUMBNAIL_DPI: 72,

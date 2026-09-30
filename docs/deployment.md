@@ -35,8 +35,10 @@ HTTP handlers, bounded by the 120 s per-stage deadline.
 | `NODE_ENV` | `development` | `production` serves built `dist/` |
 | `CLEARDOC_MAX_FILE_SIZE_BYTES` | `31457280` | Upload size limit |
 | `CLEARDOC_MAX_PAGE_COUNT` | `50` | PDF page limit |
+| `CLEARDOC_MAX_IMAGE_PIXELS` | `50000000` | Decoded-pixel ceiling for raster images |
 | `CLEARDOC_RETENTION_MS` | `3600000` | Temp-file retention |
 | `CLEARDOC_CLEANUP_INTERVAL_MS` | `300000` | GC cycle interval |
+| `CLEARDOC_PROCESSING_DEADLINE_MS` | `120000` | Per-stage processing deadline |
 | `CLEARDOC_PREVIEW_DPI` / `CLEARDOC_VERIFICATION_DPI` | `150` | Rasterization resolutions |
 
 No secrets are required; ClearDoc performs no outbound calls.

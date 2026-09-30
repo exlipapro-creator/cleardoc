@@ -46,9 +46,15 @@ processing, fixtures.
 
 ## Resource limits
 
-- Upload size (30 MB) and page count (50) enforced at ingest.
-- 120 s processing deadline per stage (`withDeadline` race in routes.ts).
-- Rate limiter caps request amplification; previews render at a fixed configured DPI.
+- Upload size (30 MB), page count (50), and decoded image resolution (50 MP)
+  enforced at ingest (`IMAGE_TOO_LARGE` 413 for over-limit rasters).
+- Processing deadline per stage (default 120 s, tunable via
+  `CLEARDOC_PROCESSING_DEADLINE_MS`): a `withDeadline` race in routes.ts turns
+  pathological documents into `PROCESSING_FAILED`/`VERIFICATION_FAILED` instead
+  of a hang; deadline-mapped failure states are retryable and never leave a
+  document stuck in `VERIFYING`.
+- E2E hostile phases verify all of the above plus server survival
+  (oversized upload, over-limit pages, over-limit megapixels, deadline cut-off).
 - NOT solved in V1: hard memory ceilings on pathological in-process parsing
   (single-instance deployment expectation; see limitations).
 
