@@ -4,15 +4,10 @@
  */
 import path from 'path';
 import { createCanvas } from '@napi-rs/canvas';
+import { CONFIG } from '../config.js';
+import { getPdfjs, pdfjsDocumentOptions } from './pdfjsLoader.js';
 
 let pdfjsModule: any = null;
-
-async function getPdfjs() {
-  if (!pdfjsModule) {
-    pdfjsModule = await import('pdfjs-dist/legacy/build/pdf.mjs');
-  }
-  return pdfjsModule;
-}
 
 export async function renderPageToPng(
   pdfBuffer: Buffer,
@@ -27,7 +22,7 @@ export async function renderPageToPng(
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(pdfBuffer),
     disableFontFace: false,
-    useSystemFonts: true,
+    ...pdfjsDocumentOptions(),
   });
 
   const doc = await loadingTask.promise;
@@ -42,6 +37,18 @@ export async function renderPageToPng(
 
   const canvasWidth = Math.max(1, Math.floor(viewport.width));
   const canvasHeight = Math.max(1, Math.floor(viewport.height));
+
+  // Rendered-pixel ceiling: a hostile page-size PDF (huge MediaBox) must fail
+  // with a deterministic JSON-mapped error, not a native canvas allocation
+  // failure. The check uses the same width×height arithmetic as raster ingest.
+  const renderPixels = canvasWidth * canvasHeight;
+  if (renderPixels > CONFIG.MAX_RENDER_PIXELS) {
+    const err: any = new Error(
+      `Rendered page size ${canvasWidth}x${canvasHeight} (${Math.round(renderPixels / 1e6)} MP at ${dpi} dpi) exceeds the ${Math.round(CONFIG.MAX_RENDER_PIXELS / 1e6)} MP limit.`
+    );
+    err.code = 'RENDER_TOO_LARGE';
+    throw err;
+  }
 
   const canvas = createCanvas(canvasWidth, canvasHeight);
   const ctx = canvas.getContext('2d');
@@ -67,6 +74,7 @@ export async function renderAllPagesToPng(
   const pdfjs = await getPdfjs();
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(pdfBuffer),
+    ...pdfjsDocumentOptions(),
   });
   const doc = await loadingTask.promise;
   const total = doc.numPages;

@@ -68,6 +68,17 @@ Free has no persistent disk to host one.
   measured ~802 MB on a fresh production instance; 16 MP measured ~440 MB.
   Over-limit images are rejected at ingest with `413 IMAGE_TOO_LARGE` before
   any memory-intensive processing begins.
+- **PDF text density.** Render memory on text-dense pages scales with
+  per-page text **operations**, not file bytes or page count (a 368 KB,
+  1-page PDF with ~20,000 text items measured 833 MB peak RSS; 5,000–8,000
+  items measured 266–420 MB). Inspection stops early at
+  `CLEARDOC_MAX_TEXT_ITEMS=8000` cumulative text items and the upload is
+  rejected with `400 PDF_TOO_COMPLEX` before any preview render.
+- **PDF page size.** Extreme MediaBoxes (e.g. A0×10 ≈ 3,487 MP at 150 dpi)
+  previously crashed the native canvas allocator (silent death, connection
+  reset). Pages rendering beyond `CLEARDOC_MAX_RENDER_PIXELS=16000000` now
+  fail deterministically with `400 RENDER_TOO_LARGE` in milliseconds, before
+  any pixels are allocated.
 - **Single instance.** Processing is admission-gated at
   `CLEARDOC_MAX_CONCURRENT_PROCESSES=1` simultaneous pipeline. Excess
   requests wait up to `CLEARDOC_PROCESS_SLOT_WAIT_MS` (5 s), then receive
@@ -132,6 +143,8 @@ HTTP handlers, bounded by the 120 s per-stage deadline.
 | `CLEARDOC_MAX_FILE_SIZE_BYTES` | `31457280` | Upload size limit |
 | `CLEARDOC_MAX_PAGE_COUNT` | `50` | PDF page limit |
 | `CLEARDOC_MAX_IMAGE_PIXELS` | `16000000` | Decoded-pixel ceiling for raster images (16 MP = largest measured-safe value for 512 MB Render Free; 20 MP measured ~522 MB peak) |
+| `CLEARDOC_MAX_TEXT_ITEMS` | `8000` | Cumulative PDF text-item ceiling — inspection stops early and rejects with `400 PDF_TOO_COMPLEX` (render memory scales with text operations, not bytes/pages) |
+| `CLEARDOC_MAX_RENDER_PIXELS` | `16000000` | Rendered-page pixel ceiling — oversized pages fail with `400 RENDER_TOO_LARGE` instead of a native allocation crash |
 | `CLEARDOC_RETENTION_MS` | `3600000` | Temp-file retention |
 | `CLEARDOC_CLEANUP_INTERVAL_MS` | `300000` | GC cycle interval |
 | `CLEARDOC_PROCESSING_DEADLINE_MS` | `120000` | Per-stage processing deadline |

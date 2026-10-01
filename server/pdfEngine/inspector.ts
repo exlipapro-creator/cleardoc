@@ -4,6 +4,8 @@
  */
 import crypto from 'crypto';
 import { PDFDocument } from 'pdf-lib';
+import { CONFIG } from '../config.js';
+import { pdfjsDocumentOptions } from './pdfjsLoader.js';
 
 let pdfjsModule: any = null;
 
@@ -95,7 +97,7 @@ export async function inspectPdf(pdfBuffer: Buffer): Promise<PdfInspectionResult
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(pdfBuffer),
     disableFontFace: false,
-    useSystemFonts: true,
+    ...pdfjsDocumentOptions(),
   });
 
   const doc = await loadingTask.promise;
@@ -105,6 +107,12 @@ export async function inspectPdf(pdfBuffer: Buffer): Promise<PdfInspectionResult
   let totalTextCount = 0;
   let totalLinks = 0;
   let totalAnnotations = 0;
+  // Cumulative text-item count across ALL pages. Enforced against
+  // CONFIG.MAX_TEXT_ITEMS DURING extraction (early-stop): render memory on
+  // text-dense pages scales with per-page text operations, not file bytes or
+  // page count, so a modest-size PDF can otherwise drive multi-hundred-MB
+  // renders. Stopping here rejects the document before any preview render.
+  let textItemCount = 0;
 
   for (let i = 1; i <= pageCount; i++) {
     const page = await doc.getPage(i);
@@ -166,6 +174,17 @@ export async function inspectPdf(pdfBuffer: Buffer): Promise<PdfInspectionResult
           y: Math.round(vy),
         },
       });
+
+      // Early-stop ceiling: reject pathologically dense documents at
+      // inspection time, before the memory-intensive preview renders run.
+      if (++textItemCount > CONFIG.MAX_TEXT_ITEMS) {
+        try { await loadingTask.destroy(); } catch { /* already torn down */ }
+        const err: any = new Error(
+          `Document exceeds the supported text density (more than ${CONFIG.MAX_TEXT_ITEMS} text elements by page ${i}).`
+        );
+        err.code = 'PDF_TOO_COMPLEX';
+        throw err;
+      }
 
       textPieces.push(item.str);
       totalTextCount += item.str.length;

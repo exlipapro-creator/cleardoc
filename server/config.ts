@@ -39,6 +39,20 @@ export const CONFIG = {
   // 16 MP is therefore the largest MEASURED-SAFE default; see
   // docs/deployment.md "Render Free". Override via CLEARDOC_MAX_IMAGE_PIXELS.
   MAX_IMAGE_PIXELS: parsePositiveInt(process.env.CLEARDOC_MAX_IMAGE_PIXELS, 16000000, 'CLEARDOC_MAX_IMAGE_PIXELS'),
+  // PDF text-item ceiling (MEASURED, final validation pass 2026-10): render
+  // memory on text-dense pages scales with per-page text OPERATIONS, not file
+  // bytes or page count — a 368 KB / 1-page PDF with ~20,000 text items
+  // measured 833 MB server peak RSS (over a 512 MB host) and ~85 s per render,
+  // while 5,000–8,000 items measured 266–420 MB even cold. Byte size and page
+  // count predict neither. Inspection stops early at this cumulative item
+  // count and the upload is rejected honestly before any preview render.
+  MAX_TEXT_ITEMS: parsePositiveInt(process.env.CLEARDOC_MAX_TEXT_ITEMS, 8000, 'CLEARDOC_MAX_TEXT_ITEMS'),
+  // Rendered-page pixel ceiling for PDF page previews/verification renders.
+  // Mirrors MAX_IMAGE_PIXELS so a hostile page-size PDF (e.g. A0×10 ≈ 803 MP
+  // at 150 dpi) fails with a deterministic JSON error instead of a native
+  // canvas allocation failure (previously: silent skia crash → connection
+  // reset). 16 MP render = 64 MB bitmap, well inside a 512 MB host.
+  MAX_RENDER_PIXELS: parsePositiveInt(process.env.CLEARDOC_MAX_RENDER_PIXELS, 16000000, 'CLEARDOC_MAX_RENDER_PIXELS'),
   RETENTION_MS: parsePositiveInt(process.env.CLEARDOC_RETENTION_MS, 3600000, 'CLEARDOC_RETENTION_MS'), // 1 hour
   CLEANUP_INTERVAL_MS: parsePositiveInt(process.env.CLEARDOC_CLEANUP_INTERVAL_MS, 300000, 'CLEARDOC_CLEANUP_INTERVAL_MS'), // 5 min
   PROCESSING_DEADLINE_MS: parsePositiveInt(process.env.CLEARDOC_PROCESSING_DEADLINE_MS, 120000, 'CLEARDOC_PROCESSING_DEADLINE_MS'), // per-stage processing deadline

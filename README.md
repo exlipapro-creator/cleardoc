@@ -11,7 +11,7 @@ ClearDoc never confuses *"the processing function returned successfully"* with
 
 ## What it does
 
-1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 16 megapixels decoded by default for raster images — the largest MEASURED-safe ceiling for a 512 MB Render Free instance; override with `CLEARDOC_MAX_IMAGE_PIXELS`).
+1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 16 megapixels decoded by default for raster images — the largest MEASURED-safe ceiling for a 512 MB Render Free instance; override with `CLEARDOC_MAX_IMAGE_PIXELS`). PDFs are additionally bounded by a text-density ceiling (`CLEARDOC_MAX_TEXT_ITEMS`, default 8,000 items — render memory scales with text operations, not file size) and a rendered-page pixel ceiling (`CLEARDOC_MAX_RENDER_PIXELS`, default 16 MP).
 2. **Analyze** — real structural inspection (PDF text items, fonts, images) or real
    pixel-level background-deviation analysis (raster images). A document with no
    watermark gets **zero candidates**, honestly.
@@ -64,8 +64,8 @@ npm run dev        # tsx server.ts → http://localhost:3000 (Vite middleware, H
 ```bash
 npm run lint       # TypeScript, strict, whole project
 npm test           # 17 unit/integration tests (engines, detector honesty, GC, state machine, pipeline gate, config safety)
-npm run test:e2e   # 97-check live E2E: boots a real server, full release + hardening checklist
-BUILD=prod npm run test:e2e   # same 97 checks against the production build artifacts
+npm run test:e2e   # 103-check live E2E: boots a real server, full release + hardening checklist
+BUILD=prod npm run test:e2e   # same 103 checks against the production build artifacts
 ```
 
 The E2E suite covers: happy paths (PDF + raster), IDOR/cross-session access,
@@ -75,7 +75,7 @@ gating, failure paths, rate limiting — a resource-exhaustion phase
 (oversized upload, over-limit page count, over-limit image resolution, and a
 deterministic processing-deadline cut-off asserting PROCESSING_FAILED with the
 server surviving) — plus a deployment-hardening phase: exact image-pixel
-boundary behavior at the 16 MP ceiling, processing admission-gate semantics
+boundary behavior at the 16 MP ceiling, PDF text-density and page-size ceilings, processing admission-gate semantics
 (one 200 + one 503 SERVICE_BUSY on concurrent heavy jobs, slot released on
 success), deterministic post-restart session expiry, and health/uptime probes.
 

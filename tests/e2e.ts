@@ -240,6 +240,36 @@ async function generateManyPagePdf(pages: number): Promise<Buffer> {
     .toBuffer();
 }
 
+/**
+ * Hostile fixture: PDF with a single page of `ops` text draw operations —
+ * per-page text-OPERATION count (not bytes/pages) drives render memory
+ * (measured: ~20k ops → 833 MB peak; ~8k ops → ≤420 MB).
+ */
+async function generateDenseTextPdf(ops: number): Promise<Buffer> {
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const page = pdf.addPage([595, 842]);
+  const chunk = 'Quarterly operations remained resilient across every business unit with disciplined cost management and steady enterprise platform adoption metrics. ';
+  for (let l = 0; l < ops; l++) {
+    page.drawText(chunk, { x: 50 + (l % 2) * 8, y: 820 - (l % 65) * 12, size: 9, font, color: rgb(0.2, 0.2, 0.2) });
+  }
+  page.drawText('DRAFT', { x: 150, y: 300, size: 96, font: bold, color: rgb(0.9, 0.2, 0.2) });
+  return Buffer.from(await pdf.save());
+}
+
+/**
+ * Hostile fixture: PDF with an extreme page size (MediaBox scaled by
+ * `scale`) — renders to ~803 MP at 150 dpi when scale=10 (A0×10).
+ */
+async function generateHugePagePdf(scale: number): Promise<Buffer> {
+  const pdf = await PDFDocument.create();
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const page = pdf.addPage([3370 * scale, 2384 * scale]);
+  page.drawText('HUGE PAGE DRAFT', { x: 100 * scale, y: 1200 * scale, size: 50 * scale, font: bold, color: rgb(0.9, 0.2, 0.2) });
+  return Buffer.from(await pdf.save());
+}
+
 // ---------------------------------------------------------------------------
 // Main checklist
 // ---------------------------------------------------------------------------
@@ -378,7 +408,11 @@ async function runCoreChecks(): Promise<void> {
       processDoc(P6, docR, { selectedCandidateIds: [candR] }),
     ]);
     const codes = [r1.status, r2.status].sort().join(',');
-    check('35 race: one wins, loser gets 200|409 (never 500)', ['200,200', '200,409'].includes(codes), codes);
+    // Gate semantics (deployment hardening): the loser either loses the CAS
+    // claim (409) or times out waiting for the single processing slot when the
+    // winner holds it beyond the 5s slot-wait window (503 SERVICE_BUSY with
+    // Retry-After). Never 500, never a hang, exactly one winner.
+    check('35 race: one wins, loser gets 200|409|503-SERVICE_BUSY (never 500)', ['200,200', '200,409', '200,503'].includes(codes), codes);
     const stR = (await getDoc(P6, docR)).json.document.status;
     check('36 race: coherent terminal state', ['COMPLETED', 'REVIEW_REQUIRED'].includes(stR), stR);
     const outFiles = fs
@@ -646,8 +680,53 @@ async function runHardeningChecks(): Promise<void> {
       `status=${prG3.status} doc=${prG3.json?.document?.status}`
     );
 
-    // Gate state is observable in /health (diagnostics, no secrets).
-    const hX = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+  // ===== Phase W — PDF complexity ceilings (final validation pass) =====
+  // Byte size and page count do not predict PDF render memory; per-page text
+  // OPERATIONS do (measured: ~20k ops → 833 MB; ~8k ops → ≤420 MB).
+  {
+    const W = newSession();
+    // W01: text-dense PDF (1 page, ~26k ops, 37 KB!) must be rejected at
+    // UPLOAD with PDF_TOO_COMPLEX — before any preview render.
+    const dense = await generateDenseTextPdf(26000);
+    const upDense = await upload(W, 'hostile_dense.pdf', dense);
+    check('W01 text-dense PDF (>8k items) rejected at upload → PDF_TOO_COMPLEX',
+      upDense.status === 400 && upDense.json?.error?.code === 'PDF_TOO_COMPLEX',
+      `got ${upDense.status} ${JSON.stringify(upDense.json).slice(0, 140)}`);
+
+    // W02: session still usable after the rejection (no residue blocking it).
+    const tempProbe = await upload(W, 'probe_clean_session.pdf', await generateDenseTextPdf(10));
+    check('W02 session still usable after complexity rejection (no residue)',
+      tempProbe.status === 201 && !!tempProbe.json?.document?.id,
+      `got ${tempProbe.status}`);
+
+    // W03: legal density (6k ops) completes the full journey.
+    const legalDense = await generateDenseTextPdf(6000);
+    const upLegal = await upload(W, 'dense_legal.pdf', legalDense);
+    const anLegal = await analyze(W, upLegal.json!.document.id);
+    const prLegal = await processDoc(W, upLegal.json!.document.id, {
+      selectedCandidateIds: anLegal.json!.analysis.candidates.map((c: any) => c.id),
+    });
+    check('W03 6k-op text-dense PDF completes with independent verification',
+      prLegal.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prLegal.json?.document?.status),
+      `got ${prLegal.status} ${prLegal.json?.document?.status} ${JSON.stringify(prLegal.json?.verification?.status || '')}`);
+
+    // W04/W05: extreme page-size PDFs fail deterministically at upload —
+    // never a native canvas allocation crash (previously: silent death,
+    // connection reset, no JSON).
+    for (const [scale, label] of [[10, 'A0x10 (~3487 MP render)'], [2.5, 'A0x2.5 (~218 MP render)']] as Array<[number, string]>) {
+      const hp = await upload(W, `hostile_hugepage_${scale}.pdf`, await generateHugePagePdf(scale));
+      check(`W0${scale === 10 ? 4 : 5} huge-page PDF (${label}) rejected at upload → 400 RENDER_TOO_LARGE (deterministic JSON)`,
+        hp.status === 400 && hp.json?.error?.code === 'RENDER_TOO_LARGE',
+        `got ${hp.status} ${JSON.stringify(hp.json).slice(0, 140)}`);
+    }
+
+    // W06: server still healthy after complexity hostiles.
+    const healthW = await fetch(`http://127.0.0.1:${PORT}/health`);
+    check('W06 server healthy after PDF-complexity hostiles', healthW.ok);
+  }
+
+  // Gate state is observable in /health (diagnostics, no secrets).
+  const hX = await (await fetch(`http://127.0.0.1:${PORT}` + '/health')).json();
     check(
       'X07 /health exposes gate snapshot (running<=limit, no secrets, no user data)',
       typeof hX.pipeline?.running === 'number' && hX.pipeline.running <= hX.pipeline.limit && !JSON.stringify(hX).includes('storage'),

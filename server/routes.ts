@@ -123,11 +123,31 @@ function mapUploadError(err: Error): { status: number; code: string; message: st
         code: 'IMAGE_TOO_LARGE',
         message: `Image exceeds the maximum resolution of ${Math.round(CONFIG.MAX_IMAGE_PIXELS / 1e6)} megapixels.`,
       };
+    case 'PROCESSING_DEADLINE_EXCEEDED':
+      // Ingest/analyze-stage deadline: the document could not be prepared
+      // within the server's processing budget. Honest, deterministic failure.
+      return {
+        status: 400,
+        code: 'PROCESSING_TIMEOUT',
+        message: 'This document could not be prepared for review in time. Please try a smaller or simpler document.',
+      };
     case 'UNSUPPORTED_FORMAT':
       return {
         status: 415,
         code: 'UNSUPPORTED_FORMAT',
         message: 'Unsupported file format. ClearDoc accepts PDF documents and standard images (PNG, JPEG, WEBP, TIFF).',
+      };
+    case 'PDF_TOO_COMPLEX':
+      return {
+        status: 400,
+        code: 'PDF_TOO_COMPLEX',
+        message: 'This document is too text-dense to process safely. Nothing was changed — please try a flattened or scanned copy.',
+      };
+    case 'RENDER_TOO_LARGE':
+      return {
+        status: 413,
+        code: 'RENDER_TOO_LARGE',
+        message: 'A page in this document is too large to render at the supported resolution. Nothing was changed.',
       };
     case 'INVALID_SESSION_IDENTIFIER':
       return { status: 400, code: 'INVALID_SESSION_IDENTIFIER', message: 'Invalid session identifier.' };
@@ -172,8 +192,13 @@ async function ingestDocument(
       throw err;
     }
 
-    // Generate page 1 preview render immediately
-    const rendered = await renderPageToPng(buffer, 1, CONFIG.PREVIEW_DPI);
+    // Generate page 1 preview render immediately. Deadline-bounded like
+    // processing: the ingest render is memory-intensive and must not become
+    // an unbounded (gate-free) CPU/memory path.
+    const rendered = await withDeadline(
+      renderPageToPng(buffer, 1, CONFIG.PREVIEW_DPI),
+      Date.now() + CONFIG.PROCESSING_DEADLINE_MS
+    );
     const previewPath = path.join(paths.previewsDir, `orig_p1.png`);
     await fs.promises.writeFile(previewPath, rendered.buffer);
   } else {
@@ -271,6 +296,14 @@ apiRouter.post('/documents', upload.single('file'), async (req: Request, res: Re
     res.status(201).json({ document: documentRecord, sessionId });
   } catch (err: any) {
     console.error('[Upload Error]:', err);
+    // Ingest-time rejections that occur AFTER the file was quarantined to
+    // storage must clean the session immediately (privacy + disk hygiene);
+    // GC would otherwise hold the rejected original for the full retention
+    // window.
+    if (err?.code === 'PDF_TOO_COMPLEX' || err?.code === 'RENDER_TOO_LARGE') {
+      const sid = (req as any).sessionId;
+      if (sid) await storageService.deleteSession(sid).catch(() => undefined);
+    }
     const mapped = mapUploadError(err);
     const status = typeof err.status === 'number' ? err.status : mapped.status;
     const code = err.code || mapped.code;
@@ -335,11 +368,15 @@ apiRouter.post('/documents/:id/analyze', async (req: Request, res: Response): Pr
       candidates = detection.candidates;
       summary = detection.summary;
 
-      // Render previews for all pages
+      // Render previews for all pages (deadline-bounded like processing)
+      const analyzeDeadline = Date.now() + CONFIG.PROCESSING_DEADLINE_MS;
       for (let p = 1; p <= doc.pageCount; p++) {
         const previewPath = path.join(paths.previewsDir, `orig_p${p}.png`);
         if (!fs.existsSync(previewPath)) {
-          const rendered = await renderPageToPng(buffer, p, CONFIG.PREVIEW_DPI);
+          const rendered = await withDeadline(
+            renderPageToPng(buffer, p, CONFIG.PREVIEW_DPI),
+            analyzeDeadline
+          );
           await fs.promises.writeFile(previewPath, rendered.buffer);
         }
       }
