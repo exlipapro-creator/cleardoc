@@ -28,6 +28,7 @@ import { verifyProcessedPdf } from './verificationEngine/verifier.js';
 import { processRasterWatermark } from './rasterEngine/processor.js';
 import { detectRasterWatermarks } from './rasterEngine/detector.js';
 import { verifyProcessedRaster } from './rasterEngine/verifier.js';
+import { pipelineGate } from './pipeline.js';
 import {
   generateDraftPdfFixture,
   generateConfidentialPdfFixture,
@@ -426,12 +427,12 @@ apiRouter.get('/documents/:id/analysis', (req: Request, res: Response): void => 
 });
 
 /**
- * POST /api/documents/:id/process
+ * POST /api/documents/:id/process (handler)
  * Executes removal plan and independent verification.
  * For PDFs: native surgical content-stream removal + pixel/structural verification.
  * For images: localized raster restoration + real measured pixel-diff verification.
  */
-apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Promise<void> => {
+async function handleProcessRequest(req: Request, res: Response): Promise<void> {
   let jobId = '';
   let documentId = req.params.id;
   try {
@@ -713,6 +714,34 @@ apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Pr
         message: 'Watermark removal failed during processing. You can retry processing from the review screen.',
       },
     });
+  }
+}
+
+/**
+ * POST /api/documents/:id/process — route with memory-safety admission gate.
+ * Expensive processing runs through a bounded in-process semaphore so
+ * concurrent pipelines cannot multiply peak memory toward OOM on a small
+ * host (measured: a single large raster pipeline is a large fraction of a
+ * Render Free instance's RAM). Rejected excess work gets an honest,
+ * deterministic 503 SERVICE_BUSY with Retry-After — never a hang, and the
+ * slot is always released (success/failure/throw/timeout).
+ */
+apiRouter.post('/documents/:id/process', async (req: Request, res: Response): Promise<void> => {
+  const slot = await pipelineGate.acquire();
+  if (!slot.ok) {
+    res.setHeader('Retry-After', '3');
+    res.status(503).json({
+      error: {
+        code: 'SERVICE_BUSY',
+        message: 'The document processor is already working on another document. Please retry in a few seconds.',
+      },
+    });
+    return;
+  }
+  try {
+    await handleProcessRequest(req, res);
+  } finally {
+    slot.release();
   }
 });
 

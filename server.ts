@@ -8,8 +8,9 @@ import path from 'path';
 import fs from 'fs';
 import { CONFIG } from './server/config.js';
 import { apiRouter } from './server/routes.js';
-import { startCleanupWorker } from './server/cleanup.js';
-import { getMetadataBackendKind } from './server/db.js';
+import { pipelineGate } from './server/pipeline.js';
+import { startCleanupWorker, stopCleanupWorker, runCleanupCycle } from './server/cleanup.js';
+import { getMetadataBackendKind, db } from './server/db.js';
 
 async function bootstrap() {
   const app = express();
@@ -43,6 +44,10 @@ async function bootstrap() {
       engines: CONFIG.ENGINE_VERSIONS,
       metadata: getMetadataBackendKind(),
       multiInstance: CONFIG.SHARED_DB_PATH ? true : false,
+      // Admission-gate diagnostics (counts only — no secrets, no paths, no
+      // user data). Lets external monitoring and operators see whether the
+      // processor is saturated without exposing anything sensitive.
+      pipeline: pipelineGate.snapshot(),
       timestamp: new Date().toISOString(),
     });
   });
@@ -84,14 +89,70 @@ async function bootstrap() {
     });
   }
 
-  server.listen(CONFIG.PORT, '0.0.0.0', () => {
-    console.log(`[ClearDoc Server] Listening on http://0.0.0.0:${CONFIG.PORT} (${process.env.NODE_ENV || 'development'})`);
+  await new Promise<void>((resolve) => {
+    server.listen(CONFIG.PORT, '0.0.0.0', () => {
+      console.log(`[ClearDoc Server] Listening on http://0.0.0.0:${CONFIG.PORT} (${process.env.NODE_ENV || 'development'})`);
+      resolve();
+    });
   });
 
   // Fail fast on infrastructure signals instead of dying mid-request.
   process.on('unhandledRejection', (reason) => {
     console.error('[ClearDoc] Unhandled promise rejection:', reason);
   });
+
+  // Graceful shutdown: Render sends SIGTERM on every redeploy/restart. Stop
+  // accepting new work, close idle keep-alive connections, give in-flight
+  // requests a bounded window, run one final GC cycle so already-expired temp
+  // artifacts do not linger, then release backend resources and exit — never
+  // waiting indefinitely. Processing cut off by the deadline is honest:
+  // affected documents never report a false COMPLETED (their metadata is
+  // ephemeral and vanishes with the process).
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[ClearDoc Server] ${signal} received — graceful shutdown (deadline ${CONFIG.SHUTDOWN_DEADLINE_MS}ms)...`);
+
+    const forceExit = setTimeout(() => {
+      console.error('[ClearDoc Server] Shutdown deadline exceeded — exiting now.');
+      process.exit(1);
+    }, CONFIG.SHUTDOWN_DEADLINE_MS);
+    if (forceExit.unref) forceExit.unref();
+
+    const closeIdle = (server as any).closeIdleConnections;
+    if (typeof closeIdle === 'function') closeIdle.call(server);
+
+    server.close(() => {
+      console.log('[ClearDoc Server] HTTP server closed.');
+      const finish = () => {
+        clearTimeout(forceExit);
+        process.exit(0);
+      };
+      try {
+        stopCleanupWorker();
+        runCleanupCycle()
+          .catch(() => undefined)
+          .then(() => {
+            try {
+              db.close?.();
+            } catch {
+              /* backend already closed */
+            }
+          })
+          .catch(() => undefined)
+          .then(finish, finish);
+      } catch {
+        finish();
+      }
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  // Windows console-event equivalent of SIGTERM (no-op on POSIX). Render
+  // sends SIGTERM; local Windows testing delivers CTRL_BREAK_EVENT.
+  process.on('SIGBREAK', () => shutdown('SIGBREAK'));
 }
 
 bootstrap().catch((err) => {

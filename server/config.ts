@@ -7,17 +7,55 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+/**
+ * Parses a positive integer env override. Invalid configuration must fail
+ * loudly instead of silently disabling a resource limit (a NaN or <=0 limit
+ * would de-facto disable the protection), so invalid values throw at boot.
+ */
+function parsePositiveInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `[ClearDoc Config] Invalid ${name}="${raw}" — must be a positive integer. Refusing to start with an invalid resource limit.`
+    );
+  }
+  return value;
+}
+
 export const CONFIG = {
   PORT: parseInt(process.env.PORT || '3000', 10),
   NODE_ENV: process.env.NODE_ENV || 'development',
-  
+
   // Storage & Limits
-  MAX_FILE_SIZE_BYTES: parseInt(process.env.CLEARDOC_MAX_FILE_SIZE_BYTES || '31457280', 10), // 30 MB
-  MAX_PAGE_COUNT: parseInt(process.env.CLEARDOC_MAX_PAGE_COUNT || '50', 10),
-  MAX_IMAGE_PIXELS: parseInt(process.env.CLEARDOC_MAX_IMAGE_PIXELS || '50000000', 10), // 50 MP decoded-pixel ceiling for raster images
-  RETENTION_MS: parseInt(process.env.CLEARDOC_RETENTION_MS || '3600000', 10), // 1 hour
-  CLEANUP_INTERVAL_MS: parseInt(process.env.CLEARDOC_CLEANUP_INTERVAL_MS || '300000', 10), // 5 min
-  PROCESSING_DEADLINE_MS: parseInt(process.env.CLEARDOC_PROCESSING_DEADLINE_MS || '120000', 10), // per-stage processing deadline
+  MAX_FILE_SIZE_BYTES: parsePositiveInt(process.env.CLEARDOC_MAX_FILE_SIZE_BYTES, 31457280, 'CLEARDOC_MAX_FILE_SIZE_BYTES'), // 30 MB
+  MAX_PAGE_COUNT: parsePositiveInt(process.env.CLEARDOC_MAX_PAGE_COUNT, 50, 'CLEARDOC_MAX_PAGE_COUNT'),
+  // Decoded-pixel ceiling for raster images. Default is deployment-safe for
+  // Render Free (512 MB). MEASURED on a fresh production instance:
+  //   41 MP pipeline → ~802 MB peak RSS (old 50 MP default = predictable OOM)
+  //   20 MP pipeline → ~522 MB peak RSS (still above the 512 MB envelope)
+  //   16 MP pipeline → ~440 MB peak RSS (≈70 MB headroom — safe)
+  //   12 MP pipeline → ~341 MB peak RSS
+  // 16 MP is therefore the largest MEASURED-SAFE default; see
+  // docs/deployment.md "Render Free". Override via CLEARDOC_MAX_IMAGE_PIXELS.
+  MAX_IMAGE_PIXELS: parsePositiveInt(process.env.CLEARDOC_MAX_IMAGE_PIXELS, 16000000, 'CLEARDOC_MAX_IMAGE_PIXELS'),
+  RETENTION_MS: parsePositiveInt(process.env.CLEARDOC_RETENTION_MS, 3600000, 'CLEARDOC_RETENTION_MS'), // 1 hour
+  CLEANUP_INTERVAL_MS: parsePositiveInt(process.env.CLEARDOC_CLEANUP_INTERVAL_MS, 300000, 'CLEARDOC_CLEANUP_INTERVAL_MS'), // 5 min
+  PROCESSING_DEADLINE_MS: parsePositiveInt(process.env.CLEARDOC_PROCESSING_DEADLINE_MS, 120000, 'CLEARDOC_PROCESSING_DEADLINE_MS'), // per-stage processing deadline
+
+  // Processing admission gate: maximum simultaneous expensive processing
+  // pipelines (PDF/raster removal + verification). Default 1: measured peak
+  // RSS of a single 20 MP pipeline is a large fraction of a Render Free
+  // instance's 512 MB, so concurrent pipelines multiply toward OOM. Excess
+  // requests wait up to PROCESS_SLOT_WAIT_MS, then receive an honest 503.
+  MAX_CONCURRENT_PROCESSES: parsePositiveInt(process.env.CLEARDOC_MAX_CONCURRENT_PROCESSES, 1, 'CLEARDOC_MAX_CONCURRENT_PROCESSES'),
+  PROCESS_SLOT_WAIT_MS: parsePositiveInt(process.env.CLEARDOC_PROCESS_SLOT_WAIT_MS, 5000, 'CLEARDOC_PROCESS_SLOT_WAIT_MS'),
+
+  // Bounded graceful-shutdown deadline for SIGTERM (Render sends it on
+  // redeploy/restart). After this the process exits regardless of in-flight
+  // work — restart semantics stay honest (in-flight jobs are lost, never
+  // falsely reported as completed).
+  SHUTDOWN_DEADLINE_MS: parsePositiveInt(process.env.CLEARDOC_SHUTDOWN_DEADLINE_MS, 10000, 'CLEARDOC_SHUTDOWN_DEADLINE_MS'),
   
   // Rendering DPI
   THUMBNAIL_DPI: 72,

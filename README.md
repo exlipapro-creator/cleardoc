@@ -11,7 +11,7 @@ ClearDoc never confuses *"the processing function returned successfully"* with
 
 ## What it does
 
-1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 50 megapixels for raster images).
+1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 16 megapixels decoded by default for raster images — the largest MEASURED-safe ceiling for a 512 MB Render Free instance; override with `CLEARDOC_MAX_IMAGE_PIXELS`).
 2. **Analyze** — real structural inspection (PDF text items, fonts, images) or real
    pixel-level background-deviation analysis (raster images). A document with no
    watermark gets **zero candidates**, honestly.
@@ -30,7 +30,8 @@ ClearDoc never confuses *"the processing function returned successfully"* with
    `REVIEW_REQUIRED` documents can be downloaded.
 7. **Automatic cleanup** — all originals, outputs, previews and intermediates are
    deleted one hour after upload (configurable), by a periodic GC worker plus a
-   startup sweep for files orphaned by a restart.
+   startup sweep for files orphaned by a restart. Download promptly: outputs
+   share the 1-hour ephemeral lifecycle.
 
 ## Supported formats
 
@@ -62,18 +63,21 @@ npm run dev        # tsx server.ts → http://localhost:3000 (Vite middleware, H
 
 ```bash
 npm run lint       # TypeScript, strict, whole project
-npm test           # 12 unit/integration tests (engines, detector honesty, GC, state machine)
-npm run test:e2e   # 70-check live E2E: boots a real server, full release checklist
-BUILD=prod npm run test:e2e   # same 70 checks against the production build artifacts
+npm test           # 17 unit/integration tests (engines, detector honesty, GC, state machine, pipeline gate, config safety)
+npm run test:e2e   # 97-check live E2E: boots a real server, full release + hardening checklist
+BUILD=prod npm run test:e2e   # same 97 checks against the production build artifacts
 ```
 
 The E2E suite covers: happy paths (PDF + raster), IDOR/cross-session access,
 path traversal, upload validation (fake/renamed/corrupt/truncated/empty files),
 state-machine gates, duplicate-processing race, manual raster regions, download
-gating, failure paths, rate limiting — plus a resource-exhaustion phase
+gating, failure paths, rate limiting — a resource-exhaustion phase
 (oversized upload, over-limit page count, over-limit image resolution, and a
 deterministic processing-deadline cut-off asserting PROCESSING_FAILED with the
-server surviving).
+server surviving) — plus a deployment-hardening phase: exact image-pixel
+boundary behavior at the 16 MP ceiling, processing admission-gate semantics
+(one 200 + one 503 SERVICE_BUSY on concurrent heavy jobs, slot released on
+success), deterministic post-restart session expiry, and health/uptime probes.
 
 ## Production deployment
 
@@ -95,11 +99,18 @@ NODE_ENV=production PORT=3000 node dist/server.js
   setting `CLEARDOC_SHARED_DB_PATH` (SQLite, zero external dependencies) and
   `CLEARDOC_SHARED_STORAGE_ROOT` (shared volume) on every instance. See
   `docs/deployment.md` for the verified topology and its constraints.
+- **Processing admission gate**: heavy processing (removal + verification) is
+  capped at `CLEARDOC_MAX_CONCURRENT_PROCESSES` simultaneous pipelines
+  (default **1** — a memory-safety decision measured against a 512 MB
+  Render Free instance). Excess requests wait up to
+  `CLEARDOC_PROCESS_SLOT_WAIT_MS` (default 5 s), then receive an honest
+  `503 SERVICE_BUSY` with `Retry-After` — never a hang, never an OOM.
 - **Restart behavior (single-instance mode):** in-flight jobs are lost on
   restart; their files become orphans and are purged by the GC once retention
-  elapses. The server never reports a false `COMPLETED` after restart —
-  documents simply no longer exist. In shared (multi-instance) mode, metadata
-  and files survive individual instance restarts.
+  elapses. Stale session ids get deterministic 404s (the UI surfaces
+  SESSION_EXPIRED honestly). The server never reports a false `COMPLETED`
+  after restart. In shared (multi-instance) mode, metadata and files survive
+  individual instance restarts.
 - **PDF manual regions are not supported** — the server rejects them explicitly
   rather than silently ignoring them.
 - Removal targets stamped/overlay watermarks on reasonably uniform backgrounds.

@@ -213,18 +213,31 @@ async function generateManyPagePdf(pages: number): Promise<Buffer> {
 /**
  * Hostile fixture: high-resolution raster image (w × h) with a red stamp box
  * near the center — stresses raster analysis/processing memory and CPU.
- */
-async function generateHighResRaster(w: number, h: number): Promise<Buffer> {
+ */async function generateHighResRaster(w: number, h: number): Promise<Buffer> {
   const stampW = Math.round(w * 0.4);
   const stampH = Math.round(h * 0.2);
+
   const x0 = Math.round(w / 2 - stampW / 2);
   const y0 = Math.round(h / 2 - stampH / 2);
   const svg = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-    <rect width="${w}" height="${h}" fill="#f4f5f7"/>
     <rect x="${x0}" y="${y0}" width="${stampW}" height="${stampH}" fill="none" stroke="#d33" stroke-width="14" stroke-opacity="0.75"/>
     <text x="${w / 2}" y="${y0 + stampH / 2}" font-family="Arial" font-size="${Math.round(stampH * 0.5)}" font-weight="bold" fill="#d33" fill-opacity="0.75" text-anchor="middle" dominant-baseline="middle">SPECIMEN</text>
   </svg>`;
-  return sharp(Buffer.from(svg)).png().toBuffer();
+  // Pixel-exact canvas: sharp({create}) guarantees width×height exactly (the
+  // decoded-pixel count ClearDoc measures), with the SVG composited on top.
+  // Rendering the SVG directly would let libvips round page dimensions,
+  // breaking exact MP-boundary fixtures (documented behavior).
+  return sharp({
+    create: {
+      width: w,
+      height: h,
+      channels: 4,
+      background: { r: 244, g: 245, b: 247, alpha: 1 },
+    },
+  })
+    .composite([{ input: Buffer.from(svg) }])
+    .png()
+    .toBuffer();
 }
 
 // ---------------------------------------------------------------------------
@@ -477,41 +490,46 @@ async function runHostileChecks(): Promise<void> {
       `status=${docH1After}`
     );
 
-    const bigRaster = await generateHighResRaster(5000, 3500);
+    const bigRaster = await generateHighResRaster(4000, 3000); // 12 MP — heavy but under the 16 MP ceiling
     const upH2 = await upload(H, 'hostile_hires.png', bigRaster);
-    check('R05 17.5MP raster accepted (under the 50MP ceiling)', upH2.status === 201, `got ${upH2.status} ${JSON.stringify(upH2.json).slice(0, 120)}`);
+    check('R05 12MP raster accepted (under the 16MP ceiling)', upH2.status === 201, `got ${upH2.status} ${JSON.stringify(upH2.json).slice(0, 120)}`);
     const anH2 = await analyze(H, upH2.json.document.id);
     check('R06 17.5MP raster analysis completes (bounded ingest)', anH2.status === 200, `got ${anH2.status}`);
     const candH2 = anH2.json?.analysis?.candidates?.[0]?.id;
     const prH2 = await processDoc(H, upH2.json.document.id, candH2 ? { selectedCandidateIds: [candH2] } : { manualRegions: [{ id: 'mr_h', page: 1, bbox: { x: 100, y: 100, width: 800, height: 600 } }] });
     check(
-      'R07 17.5MP raster resolves coherently under deadline (completed or failed, never hangs)',
+      'R07 12MP raster resolves coherently under deadline (completed or failed, never hangs)',
       (prH2.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prH2.json?.document?.status)) ||
         (prH2.status >= 500 && prH2.json?.error?.code === 'PROCESSING_FAILED'),
       `status=${prH2.status} code=${prH2.json?.error?.code} doc=${prH2.json?.document?.status}`
     );
     const docH2After = (await getDoc(H, upH2.json.document.id)).json?.document?.status;
     check(
-      'R08 17.5MP raster ends in a coherent terminal state (no stuck VERIFYING)',
+      'R08 12MP raster ends in a coherent terminal state (no stuck VERIFYING)',
       ['COMPLETED', 'REVIEW_REQUIRED', 'PROCESSING_FAILED', 'VERIFICATION_FAILED'].includes(docH2After),
       `status=${docH2After}`
     );
 
     // Raster over the decoded-pixel ceiling: rejected at ingest with
     // IMAGE_TOO_LARGE (raster resource control), never processed.
-    const hugeRaster = await generateHighResRaster(9000, 6000); // 54 MP > 50 MP
+    const hugeRaster = await generateHighResRaster(9000, 6000); // 54 MP > 20 MP
     const upH3 = await upload(H, 'hostile_huge.png', hugeRaster);
     check('R11 54MP raster rejected at ingest → 413 IMAGE_TOO_LARGE', upH3.status === 413 && upH3.json?.error?.code === 'IMAGE_TOO_LARGE', `got ${upH3.status} ${JSON.stringify(upH3.json).slice(0, 140)}`);
 
-    // Legal but heavy raster: ingest and analysis must stay bounded (no crash,
-    // no unbounded work). Whether processing then finishes inside this phase's
-    // 1.5s deadline is machine-dependent, so the deterministic raster deadline
-    // proof lives in the 1ms-deadline phase (runDeadlineGateChecks).
-    const heavyRaster = await generateHighResRaster(6800, 6000); // ~41 MP, legal
+    // Deployment-safety boundary: the DEFAULT ceiling is now 16 MP (the
+    // largest MEASURED-safe value for a Render Free 512 MB instance; 20 MP
+    // measured 522 MB peak). Just over the boundary must be rejected at
+    // ingest — before any memory-intensive processing begins.
+    const justOver = await generateHighResRaster(4000, 4001); // 16.004 MP > 16 MP
+    const upJustOver = await upload(H, 'hostile_just_over.png', justOver);
+    check('R12 16.004MP raster (just over the 16MP boundary) rejected at ingest → 413 IMAGE_TOO_LARGE', upJustOver.status === 413 && upJustOver.json?.error?.code === 'IMAGE_TOO_LARGE', `got ${upJustOver.status} ${JSON.stringify(upJustOver.json).slice(0, 140)}`);
+
+    // The pre-hardening audit MEASURED this 41MP raster at ~800 MB peak RSS
+    // during processing — beyond a Render Free instance's 512 MB. Under the
+    // 20 MP default it must now be rejected EARLY, never reaching that spike.
+    const heavyRaster = await generateHighResRaster(6800, 6000); // ~41 MP
     const upH4 = await upload(H, 'hostile_heavy.png', heavyRaster);
-    check('R12 41MP raster accepted at ingest (under pixel ceiling)', upH4.status === 201, `got ${upH4.status}`);
-    const anH4 = await analyze(H, upH4.json.document.id);
-    check('R13 41MP raster analysis completes within bounds', anH4.status === 200, `got ${anH4.status}`);
+    check('R13 41MP hostile raster rejected at ingest (early IMAGE_TOO_LARGE, no processing spike)', upH4.status === 413 && upH4.json?.error?.code === 'IMAGE_TOO_LARGE', `got ${upH4.status} ${JSON.stringify(upH4.json).slice(0, 140)}`);
 
     // --- Server must still be alive and fully functional ---
     const post = await createSample(H, 'clean');
@@ -558,6 +576,120 @@ async function runDeadlineGateChecks(): Promise<void> {
     console.log('');
   } catch (err) {
     console.error('\nE2E fatal error (deadline-gate phase):', err);
+    failed++;
+    throw err;
+  }
+}
+
+/**
+ * Deployment-hardening phase (Render Free readiness).
+ * Boots with a tiny slot-wait window (CLEARDOC_PROCESS_SLOT_WAIT_MS=100) so
+ * gate rejection is deterministic without slowing the suite, then verifies:
+ * image-ceiling boundaries, concurrent processing admission, session-expiry
+ * determinism, restart/cold-start behavior, and health endpoints.
+ */
+async function runHardeningChecks(): Promise<void> {
+  try {
+    const X = newSession();
+
+    // === Image ceiling: the actual width×height boundary at 16 MP (measured-safe) ===
+    const atBoundary = await generateHighResRaster(4000, 4000); // exactly 16,000,000 px
+    const upB = await upload(X, 'hardening_16mp_exact.png', atBoundary);
+    check('X01 exactly-16MP raster (4000x4000 = 16,000,000 px) accepted at the boundary', upB.status === 201, `got ${upB.status} ${JSON.stringify(upB.json).slice(0, 140)}`);
+
+    const oneUnder = await generateHighResRaster(4000, 3999); // 15,996,000 px < 16 MP
+    const upU = await upload(X, 'hardening_just_under.png', oneUnder);
+    check('X02 just-under-16MP raster accepted (boundary is >, not >=)', upU.status === 201, `got ${upU.status}`);
+
+    // === Processing admission gate (limit=1, wait=100ms) ===
+    const G1 = newSession();
+    const upG1 = await createSample(G1, 'draft');
+    const docG1: string = upG1.json?.document?.id ?? '';
+    await analyze(G1, docG1);
+    const candG1 = (await getAnalysis(G1, docG1)).json.analysis.candidates[0].id;
+
+    const G2 = newSession();
+    const upG2 = await createSample(G2, 'draft');
+    const docG2: string = upG2.json?.document?.id ?? '';
+    await analyze(G2, docG2);
+    const candG2 = (await getAnalysis(G2, docG2)).json.analysis.candidates[0].id;
+
+    // Fire two process requests simultaneously: gate admits exactly one.
+    const [pG1, pG2] = await Promise.all([
+      processDoc(G1, docG1, { selectedCandidateIds: [candG1] }),
+      processDoc(G2, docG2, { selectedCandidateIds: [candG2] }),
+    ]);
+    const statuses = [pG1.status, pG2.status].sort().join(',');
+    check(
+      'X03 concurrent process requests: one admitted (200) and one deterministically rejected (503 SERVICE_BUSY)',
+      statuses === '200,503',
+      `statuses=${statuses} bodies=${JSON.stringify([pG1.json?.error, pG2.json?.error]).slice(0, 160)}`
+    );
+    const busy = [pG1, pG2].find((r) => r.status === 503);
+    check(
+      'X04 gate rejection is honest: 503 SERVICE_BUSY with Retry-After header',
+      !!busy && busy.json?.error?.code === 'SERVICE_BUSY' && !!busy.headers['retry-after'],
+      `code=${busy?.json?.error?.code} retryAfter=${busy?.headers['retry-after']}`
+    );
+    const admitted = [pG1, pG2].find((r) => r.status === 200);
+    check(
+      'X05 admitted request completes normally through the gate (success releases the slot)',
+      !!admitted && ['COMPLETED', 'REVIEW_REQUIRED'].includes(admitted.json?.document?.status),
+      `doc=${admitted?.json?.document?.status}`
+    );
+
+    // Slot must be free again after success: a third process succeeds.
+    const prG3 = await processDoc(G2, docG2, { selectedCandidateIds: [candG2] });
+    check(
+      'X06 gate recovers after completion: retry processed without service-busy',
+      prG3.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prG3.json?.document?.status),
+      `status=${prG3.status} doc=${prG3.json?.document?.status}`
+    );
+
+    // Gate state is observable in /health (diagnostics, no secrets).
+    const hX = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    check(
+      'X07 /health exposes gate snapshot (running<=limit, no secrets, no user data)',
+      typeof hX.pipeline?.running === 'number' && hX.pipeline.running <= hX.pipeline.limit && !JSON.stringify(hX).includes('storage'),
+      JSON.stringify(hX.pipeline)
+    );
+
+    // === Session expiry: restart wipes in-memory metadata; stale sessions fail honestly ===
+    const E = newSession();
+    const upE = await createSample(E, 'draft');
+    const docE: string = upE.json?.document?.id ?? '';
+    await analyze(E, docE);
+    check('X08 pre-restart document exists for its session', (await getDoc(E, docE)).status === 200);
+
+    const inst = await bootServer({ CLEARDOC_PROCESS_SLOT_WAIT_MS: '100' });
+    try {
+      const S2 = newSession();
+      check('X09 after restart, stale session id gets deterministic 404 (DOCUMENT_NOT_FOUND)', (await getDoc(E, docE, inst.port)).status === 404);
+      check('X10 after restart, stale session cannot process its old doc (no ghost state)', (await processDoc(E, docE, { selectedCandidateIds: ['x'] }, inst.port)).status === 404);
+      check('X11 fresh session on restarted server works normally', (await createSample(S2, 'draft', inst.port)).status === 201);
+      const hR = await (await fetch(`http://127.0.0.1:${inst.port}/health`)).json();
+      check('X12 restarted server reports healthy with pipeline snapshot', hR.status === 'ok' && typeof hR.pipeline?.running === 'number');
+
+      // Health must be cheap: /health never processes documents or allocates
+      // buffers — hammer it and confirm the pipeline stays idle and fast.
+      const t0 = Date.now();
+      for (let i = 0; i < 20; i++) {
+        const h = await fetch(`http://127.0.0.1:${inst.port}/health`);
+        if (!h.ok) {
+          check('X13 /health stays 200 under repeated probing', false, `failed at request ${i}`);
+          break;
+        }
+        if (i === 19) {
+          check('X13 /health stays 200 under repeated probing (cheap, no processing)', h.ok && Date.now() - t0 < 5000, `elapsed=${Date.now() - t0}ms`);
+        }
+      }
+    } finally {
+      await stopServer(inst.child);
+    }
+
+    console.log('');
+  } catch (err) {
+    console.error('\nE2E fatal error (hardening phase):', err);
     failed++;
     throw err;
   }
@@ -697,6 +829,14 @@ async function main(): Promise<void> {
     await runDeadlineGateChecks();
   } finally {
     await stopServer(gate.child);
+  }
+
+  // Phase 3.5: deployment hardening (Render Free readiness).
+  const hardening = await bootServer({ CLEARDOC_PROCESS_SLOT_WAIT_MS: '100' });
+  try {
+    await runHardeningChecks();
+  } finally {
+    await stopServer(hardening.child);
   }
 
   // Phase 4: two instances sharing SQLite + storage root (V2 topology).

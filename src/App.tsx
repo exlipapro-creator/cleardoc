@@ -20,7 +20,8 @@ import {
   RemovalStrategy,
   ManualRegion,
 } from '../shared/types.ts';
-import { Loader2, ArrowLeft, AlertCircle } from 'lucide-react';
+import { apiRequest, parseResponse, ApiError, onServiceWaking } from './api.ts';
+import { Loader2, ArrowLeft, AlertCircle, WifiOff } from 'lucide-react';
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string>(() => {
@@ -43,6 +44,11 @@ export default function App() {
     'NATIVE_OBJECT_REMOVAL'
   );
 
+  // True while the API client is probing /health because the service is
+  // genuinely unreachable (Render Free spin-down / restart). Never set by a
+  // timer — only by observed unreachable reality.
+  const [serviceWaking, setServiceWaking] = useState(false);
+
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -54,6 +60,16 @@ export default function App() {
   const announce = (msg: string) => {
     setLiveAnnouncement(msg);
   };
+
+  const onApiFailure = (err: unknown, fallback: string) => {
+    setErrorMessage(err instanceof Error ? err.message : fallback);
+    announce(`Error: ${err instanceof Error ? err.message : fallback}`);
+  };
+
+  useEffect(() => {
+    const off = onServiceWaking(() => setServiceWaking(true));
+    return off;
+  }, []);
 
   const handleFileUpload = async (file: File) => {
     try {
@@ -68,16 +84,12 @@ export default function App() {
       const headers: Record<string, string> = {};
       if (sessionId) headers['x-session-id'] = sessionId;
 
-      const res = await fetch('/api/documents', {
+      const res = await apiRequest('/api/documents', {
         method: 'POST',
         headers,
         body: formData,
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error?.message || 'Upload failed');
-      }
+      const data = await parseResponse<any>(res);
 
       setUploadProgress(70);
       const newSessionId = res.headers.get('x-session-id') || data.sessionId;
@@ -94,11 +106,11 @@ export default function App() {
       // Trigger analysis
       await triggerAnalysis(data.document.id, newSessionId);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Error uploading file');
-      announce(`Error: ${err.message}`);
+      onApiFailure(err, 'Error uploading file');
     } finally {
       setIsUploading(false);
       setUploadProgress(100);
+      setServiceWaking(false);
     }
   };
 
@@ -112,16 +124,12 @@ export default function App() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (sessionId) headers['x-session-id'] = sessionId;
 
-      const res = await fetch('/api/fixtures/create-sample', {
+      const res = await apiRequest('/api/fixtures/create-sample', {
         method: 'POST',
         headers,
         body: JSON.stringify({ fixtureType: type }),
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error?.message || 'Sample generation failed');
-      }
+      const data = await parseResponse<any>(res);
 
       const newSessionId = res.headers.get('x-session-id') || data.sessionId;
       if (newSessionId) {
@@ -136,11 +144,11 @@ export default function App() {
 
       await triggerAnalysis(data.document.id, newSessionId);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Error loading sample');
-      announce(`Error loading sample: ${err.message}`);
+      onApiFailure(err, 'Error loading sample');
     } finally {
       setIsUploading(false);
       setUploadProgress(100);
+      setServiceWaking(false);
     }
   };
 
@@ -150,15 +158,11 @@ export default function App() {
       const headers: Record<string, string> = {};
       if (sessId) headers['x-session-id'] = sessId;
 
-      const res = await fetch(`/api/documents/${docId}/analyze`, {
+      const res = await apiRequest(`/api/documents/${docId}/analyze`, {
         method: 'POST',
         headers,
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error?.message || 'Analysis failed');
-      }
+      }, 30000);
+      const data = await parseResponse<any>(res);
 
       setDocument(data.document);
       setAnalysis(data.analysis);
@@ -171,10 +175,10 @@ export default function App() {
 
       announce(`Analysis complete: ${data.analysis.candidates.length} candidates identified.`);
     } catch (err: any) {
-      const message = err.message || 'Analysis failed';
+      const message = err instanceof Error ? err.message : 'Analysis failed';
       setAnalysisError(message);
-      setErrorMessage(message);
-      announce(`Analysis error: ${message}`);
+      onApiFailure(err, 'Analysis failed');
+      setServiceWaking(false);
     }
   };
 
@@ -220,7 +224,7 @@ export default function App() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (sessionId) headers['x-session-id'] = sessionId;
 
-      const res = await fetch(`/api/documents/${document.id}/process`, {
+      const res = await apiRequest(`/api/documents/${document.id}/process`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -228,12 +232,8 @@ export default function App() {
           manualRegions,
           preferredStrategy,
         }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error?.message || 'Processing failed');
-      }
+      }, 180000);
+      const data = await parseResponse<any>(res);
 
       setJob(data.job);
       setVerification(data.verification);
@@ -241,11 +241,15 @@ export default function App() {
       setActiveStep('VERIFIED');
       announce(`Processing complete. Verification status: ${data.verification.status}`);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Processing failed');
-      setActiveStep('REVIEW');
-      announce(`Processing failed: ${err.message}`);
+      onApiFailure(err, 'Processing failed');
+      if (err instanceof ApiError && (err.code === 'SESSION_EXPIRED' || err.code === 'DOCUMENT_NOT_FOUND')) {
+        setActiveStep('UPLOAD');
+      } else {
+        setActiveStep('REVIEW');
+      }
     } finally {
       setIsProcessing(false);
+      setServiceWaking(false);
     }
   };
 
@@ -256,22 +260,19 @@ export default function App() {
       const headers: Record<string, string> = {};
       if (sessionId) headers['x-session-id'] = sessionId;
 
-      const res = await fetch(`/api/documents/${document.id}/approve-review`, {
+      const res = await apiRequest(`/api/documents/${document.id}/approve-review`, {
         method: 'POST',
         headers,
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error?.message || 'Approval failed');
-      }
+      const data = await parseResponse<any>(res);
 
       setDocument(data.document);
       announce('Document review approved. Released for download.');
     } catch (err: any) {
-      setErrorMessage(err.message || 'Approval failed');
+      onApiFailure(err, 'Approval failed');
     } finally {
       setIsApproving(false);
+      setServiceWaking(false);
     }
   };
 
@@ -310,6 +311,15 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col items-center">
+        {/* Cold-start / wake banner: shown only while /health probing confirms
+            the service is genuinely unreachable (Render Free spin-down). */}
+        {serviceWaking && (
+          <div className="w-full max-w-4xl mb-6 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs sm:text-sm flex items-center gap-2">
+            <WifiOff className="w-5 h-5 text-amber-600 shrink-0" />
+            <span>Preparing ClearDoc… the service is waking up. Your request will continue automatically.</span>
+          </div>
+        )}
+
         {/* Error notification banner */}
         {errorMessage && (
           <div className="w-full max-w-4xl mb-6 p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm flex items-center justify-between">

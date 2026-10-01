@@ -7,6 +7,7 @@ import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
 import { storageService } from '../server/storage.js';
+import { CONFIG } from '../server/config.js';
 import {
   generateDraftPdfFixture,
   generateConfidentialPdfFixture,
@@ -422,6 +423,99 @@ async function runTestSuite() {
       B.close?.();
       for (const suffix of ['', '-wal', '-shm']) {
         fs.rmSync(dbPath + suffix, { force: true });
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Deployment hardening (Render Free): admission gate + config safety
+  // ---------------------------------------------------------------------------
+
+  await test('PipelineGate: single slot, FIFO wait, direct ownership transfer (no over-admission)', async () => {
+    const { PipelineGate } = await import('../server/pipeline.js');
+    const gate = new PipelineGate(1, 10_000);
+
+    const first = await gate.acquire();
+    if (!first.ok) throw new Error('first acquire should succeed immediately');
+
+    let secondSettled: any = null;
+    const secondPromise = gate.acquire().then((r) => { secondSettled = r; return r; });
+
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(secondSettled, null, 'second acquire must wait while the slot is held');
+    assert.strictEqual(gate.snapshot().waiting, 1, 'waiter is queued');
+    assert.strictEqual(gate.snapshot().running, 1, 'running count stays at the held slot');
+
+    first.release();
+    const second = await secondPromise;
+    if (!second.ok) throw new Error('waiter must be admitted via ownership transfer');
+    assert.strictEqual(gate.snapshot().running, 1, 'ownership transfer must not increment past the limit');
+
+    second.release();
+    const third = await gate.acquire();
+    if (!third.ok) throw new Error('gate must admit after full release');
+    third.release();
+    assert.strictEqual(gate.snapshot().running, 0, 'gate fully empty after releases');
+  });
+
+  await test('PipelineGate: timeout rejects deterministically; release-on-success/failure/throw cannot deadlock', async () => {
+    const { PipelineGate } = await import('../server/pipeline.js');
+    const gate = new PipelineGate(1, 80);
+
+    const held = await gate.acquire();
+    if (!held.ok) throw new Error('held slot should be acquired');
+
+    // The gate's waiter timer is intentionally unref'd (it must never keep a
+    // shutting-down server alive), so this standalone test process needs a
+    // ref'd keepalive handle while waiting for the timed rejection.
+    const keepalive = setTimeout(() => {}, 10_000);
+    const start = Date.now();
+    const rejected = await gate.acquire();
+    clearTimeout(keepalive);
+    const elapsed = Date.now() - start;
+    assert.strictEqual(rejected.ok, false, 'excess acquire rejected on timeout');
+    if (!rejected.ok && rejected.reason !== 'TIMEOUT') throw new Error('rejection reason must be TIMEOUT');
+    assert.ok(elapsed >= 70 && elapsed < 2000, `timeout must be bounded (elapsed=${elapsed}ms)`);
+    assert.strictEqual(gate.snapshot().running, 1, 'held slot unaffected by the rejection');
+
+    held.release();
+    assert.strictEqual(gate.snapshot().running, 0, 'slot released after rejection window');
+
+    const after = await gate.acquire();
+    if (!after.ok) throw new Error('gate must admit after release');
+    after.release();
+    assert.strictEqual(gate.snapshot().running, 0);
+  });
+
+  await test('Config: Render-Free-safe defaults (16MP raster ceiling, 1 processing slot)', async () => {
+    assert.strictEqual(CONFIG.MAX_IMAGE_PIXELS, 16_000_000, 'default pixel ceiling must be the measured-safe 16 MP (20 MP measured 522MB > 512MB envelope)');
+    assert.strictEqual(CONFIG.MAX_CONCURRENT_PROCESSES, 1, 'default processing concurrency must be 1 on a 512MB envelope');
+    assert.ok(CONFIG.PROCESS_SLOT_WAIT_MS >= 5000, 'slot wait must be a meaningful bounded window');
+    assert.ok(CONFIG.SHUTDOWN_DEADLINE_MS > 0 && CONFIG.SHUTDOWN_DEADLINE_MS < 60_000, 'shutdown deadline must be bounded');
+  });
+
+  await test('Config validation: invalid resource limits fail fast instead of silently disabling protection', async () => {
+    const cases: Array<[string, string]> = [
+      ['CLEARDOC_MAX_IMAGE_PIXELS', 'not-a-number'],
+      ['CLEARDOC_MAX_IMAGE_PIXELS', '0'],
+      ['CLEARDOC_MAX_IMAGE_PIXELS', '-500'],
+      ['CLEARDOC_MAX_CONCURRENT_PROCESSES', 'NaN'],
+      ['CLEARDOC_PROCESSING_DEADLINE_MS', '1.5'],
+    ];
+    for (const [key, value] of cases) {
+      process.env[key] = value;
+      try {
+        // Cache-busted dynamic import: the query string forces a fresh module
+        // evaluation so the boot-time validation actually re-runs.
+        await import(`../server/config.js?probe=${Date.now()}-${Math.random()}`);
+        throw new Error(`${key}="${value}" was accepted — invalid limits must refuse to boot`);
+      } catch (err: any) {
+        assert.ok(
+          /Invalid CLEARDOC_/.test(String(err?.message)),
+          `expected a fail-fast validation error for ${key}="${value}", got: ${err?.message}`
+        );
+      } finally {
+        delete process.env[key];
       }
     }
   });

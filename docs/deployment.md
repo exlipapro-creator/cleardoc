@@ -29,6 +29,81 @@ CLEARDOC_SHARED_STORAGE_ROOT=/var/lib/cleardoc/storage   # shared volume for ses
   it is idempotent and safe to run concurrently.
 - Retention semantics are unchanged: 1 h temp files, purge on expiry.
 
+## Deploying to Render Free (V1 target)
+
+ClearDoc is certified for a single **Render Free web service** serving the SPA
+and API from one process. This is the recommended V1 deployment.
+
+### Service configuration
+
+```text
+Runtime:             Node
+Build command:       npm ci && npm run build
+Start command:       npm run start          (node dist/server.js)
+Health check path:   /health
+Env vars:            NODE_ENV=production
+Disk:                none (ephemeral — this is the intended model)
+```
+
+`PORT` is supplied by Render and already honored. The server binds `0.0.0.0`.
+No secrets are required. SQLite is intentionally **disabled** for V1: the
+single-instance ephemeral model needs no shared metadata store, and Render
+Free has no persistent disk to host one.
+
+### Render Free constraints and how ClearDoc relates to them
+
+- **Ephemeral filesystem.** Uploads, outputs and previews live in
+  `storage/temp` for at most 1 hour (GC) and vanish on restart, redeploy, or
+  idle spin-down. This *matches* the privacy model: documents are meant to be
+  destroyed, never retained.
+- **Idle spin-down.** After 15 minutes without inbound traffic the instance
+  sleeps; the next request waits roughly one minute while it wakes. The
+  frontend detects genuine unavailability (502/503/network errors), probes
+  `/health` on a bounded retry cadence, shows a real "waking up" state, and
+  retries the request once the service answers. There is no keep-alive ping,
+  self-ping, or fake traffic anywhere in the codebase — by design.
+- **Memory envelope (512 MB).** The raster ceiling defaults to
+  `CLEARDOC_MAX_IMAGE_PIXELS=16000000` (16 MP) — the largest **measured-safe**
+  value: 20 MP measured ~522 MB peak RSS (over the envelope) and 41 MP
+  measured ~802 MB on a fresh production instance; 16 MP measured ~440 MB.
+  Over-limit images are rejected at ingest with `413 IMAGE_TOO_LARGE` before
+  any memory-intensive processing begins.
+- **Single instance.** Processing is admission-gated at
+  `CLEARDOC_MAX_CONCURRENT_PROCESSES=1` simultaneous pipeline. Excess
+  requests wait up to `CLEARDOC_PROCESS_SLOT_WAIT_MS` (5 s), then receive
+  `503 SERVICE_BUSY` with `Retry-After`. This prevents concurrent pipelines
+  from multiplying peak memory on a small instance.
+- **Restarts at any time.** On SIGTERM the server stops accepting work,
+  closes idle connections, runs one final GC pass, and exits within a bounded
+  deadline (`CLEARDOC_SHUTDOWN_DEADLINE_MS`). In-flight jobs are lost
+  **honestly**: metadata is ephemeral, so stale sessions get deterministic
+  404s and the UI surfaces `SESSION_EXPIRED` — never a false `COMPLETED`,
+  never another user's data.
+
+### External monitoring (UptimeRobot)
+
+Create one HTTP(s) monitor against `https://<production-domain>/health`
+expecting HTTP 200 (5-minute interval on the free plan). `/health` is a
+liveness/readiness probe: it performs no document processing, allocates no
+large buffers, and exposes only version strings, backend kind, and pipeline
+counts — no secrets, paths, or user data.
+
+**Monitoring is not an application dependency.** ClearDoc works correctly with
+the monitor removed, including after a cold start. If the monitor's regular
+5-minute visits happen to reduce idle spin-downs, that is a property of the
+external monitoring arrangement, not application logic; the codebase contains
+no sleep-defeating behavior and must never gain any.
+
+### Honest expectations
+
+Do not expect zero-downtime deploys, persistent storage, or guaranteed
+always-on availability on the Free plan. Documents must be downloaded promptly
+(outputs share the 1-hour ephemeral lifecycle). If usage outgrows the Free
+envelope, the migration path is: upgrade the service's compute plan first
+(more CPU/RAM, no spin-down), raise `CLEARDOC_MAX_IMAGE_PIXELS` to match the
+new memory, and only consider multi-instance shared mode (SQLite + shared
+volume) on hosting that provides a real block/shared volume.
+
 ## Build & run
 
 ```bash
@@ -56,10 +131,13 @@ HTTP handlers, bounded by the 120 s per-stage deadline.
 | `NODE_ENV` | `development` | `production` serves built `dist/` |
 | `CLEARDOC_MAX_FILE_SIZE_BYTES` | `31457280` | Upload size limit |
 | `CLEARDOC_MAX_PAGE_COUNT` | `50` | PDF page limit |
-| `CLEARDOC_MAX_IMAGE_PIXELS` | `50000000` | Decoded-pixel ceiling for raster images |
+| `CLEARDOC_MAX_IMAGE_PIXELS` | `16000000` | Decoded-pixel ceiling for raster images (16 MP = largest measured-safe value for 512 MB Render Free; 20 MP measured ~522 MB peak) |
 | `CLEARDOC_RETENTION_MS` | `3600000` | Temp-file retention |
 | `CLEARDOC_CLEANUP_INTERVAL_MS` | `300000` | GC cycle interval |
 | `CLEARDOC_PROCESSING_DEADLINE_MS` | `120000` | Per-stage processing deadline |
+| `CLEARDOC_MAX_CONCURRENT_PROCESSES` | `1` | Max simultaneous processing pipelines (memory-safety admission gate) |
+| `CLEARDOC_PROCESS_SLOT_WAIT_MS` | `5000` | How long an excess process request waits before 503 SERVICE_BUSY |
+| `CLEARDOC_SHUTDOWN_DEADLINE_MS` | `10000` | Bounded graceful-shutdown window on SIGTERM |
 | `CLEARDOC_PREVIEW_DPI` / `CLEARDOC_VERIFICATION_DPI` | `150` | Rasterization resolutions |
 
 No secrets are required; ClearDoc performs no outbound calls.
