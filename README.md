@@ -11,7 +11,7 @@ ClearDoc never confuses *"the processing function returned successfully"* with
 
 ## What it does
 
-1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 16 megapixels decoded by default for raster images — the largest MEASURED-safe ceiling for a 512 MB Render Free instance; override with `CLEARDOC_MAX_IMAGE_PIXELS`). PDFs are additionally bounded by a text-density ceiling (`CLEARDOC_MAX_TEXT_ITEMS`, default 8,000 items — render memory scales with text operations, not file size) and a rendered-page pixel ceiling (`CLEARDOC_MAX_RENDER_PIXELS`, default 16 MP).
+1. **Upload** — PDF, PNG, JPEG, WEBP or TIFF (magic-byte validated, ≤ 30 MB, ≤ 50 pages, ≤ 16 megapixels decoded by default for raster images — the largest MEASURED-safe ceiling for a 512 MB Render Free instance; override with `CLEARDOC_MAX_IMAGE_PIXELS`). PDFs are additionally bounded by a text-density ceiling (`CLEARDOC_MAX_TEXT_ITEMS`, default 8,000 items — render memory scales with text operations, not file size) and a rendered-page pixel ceiling (`CLEARDOC_MAX_RENDER_PIXELS`, default 16 MP). Pages embedding large images are additionally bounded by a per-page embedded-image pixel ceiling (`CLEARDOC_MAX_PDF_IMAGE_PIXELS_PER_PAGE`, default 2 MP — image-decode CPU scales with embedded image pixels, not file size).
 2. **Analyze** — real structural inspection (PDF text items, fonts, images) or real
    pixel-level background-deviation analysis (raster images). A document with no
    watermark gets **zero candidates**, honestly.

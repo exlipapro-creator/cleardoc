@@ -123,6 +123,12 @@ function mapUploadError(err: Error): { status: number; code: string; message: st
         code: 'IMAGE_TOO_LARGE',
         message: `Image exceeds the maximum resolution of ${Math.round(CONFIG.MAX_IMAGE_PIXELS / 1e6)} megapixels.`,
       };
+    case 'PDF_IMAGE_TOO_LARGE':
+      return {
+        status: 413,
+        code: 'PDF_IMAGE_TOO_LARGE',
+        message: `A page in this document embeds more than ${Math.round(CONFIG.MAX_PDF_IMAGE_PIXELS_PER_PAGE / 1e6)} MP of image data. Nothing was changed.`,
+      };
     case 'PROCESSING_DEADLINE_EXCEEDED':
       // Ingest/analyze-stage deadline: the document could not be prepared
       // within the server's processing budget. Honest, deterministic failure.
@@ -300,7 +306,7 @@ apiRouter.post('/documents', upload.single('file'), async (req: Request, res: Re
     // storage must clean the session immediately (privacy + disk hygiene);
     // GC would otherwise hold the rejected original for the full retention
     // window.
-    if (err?.code === 'PDF_TOO_COMPLEX' || err?.code === 'RENDER_TOO_LARGE') {
+    if (err?.code === 'PDF_TOO_COMPLEX' || err?.code === 'RENDER_TOO_LARGE' || err?.code === 'PDF_IMAGE_TOO_LARGE') {
       const sid = (req as any).sessionId;
       if (sid) await storageService.deleteSession(sid).catch(() => undefined);
     }

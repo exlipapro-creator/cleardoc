@@ -20,7 +20,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import os from 'os';
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, degrees } from 'pdf-lib';
 import sharp from 'sharp';
 
 const IS_PROD = process.env.BUILD === 'prod';
@@ -204,7 +204,7 @@ async function generateManyPagePdf(pages: number): Promise<Buffer> {
       font,
       color: rgb(0.9, 0.2, 0.2),
       opacity: 0.25,
-      rotate: { type: 'degrees', value: -30 } as any,
+      rotate: degrees(-30),
     });
   }
   return Buffer.from(await pdf.save());
@@ -267,6 +267,29 @@ async function generateHugePagePdf(scale: number): Promise<Buffer> {
   const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
   const page = pdf.addPage([3370 * scale, 2384 * scale]);
   page.drawText('HUGE PAGE DRAFT', { x: 100 * scale, y: 1200 * scale, size: 50 * scale, font: bold, color: rgb(0.9, 0.2, 0.2) });
+  return Buffer.from(await pdf.save());
+}
+
+/**
+ * Fixture: 1-page PDF embedding a w×h JPEG image with the DRAFT watermark text
+ * on top. Used to prove the per-page embedded-image ceiling rejects over-limit
+ * pages (W07) and still accepts legal ones (W08). MEASURED (2026-10-02):
+ * 6.6 MP/page starved the event loop >15 s on 0.1 CPU while 1.4 MP/page
+ * passed — file bytes do not predict the stall.
+ */
+async function generateEmbeddedImagePdf(w: number, h: number, jpegQuality = 70): Promise<Buffer> {
+  // Flat-color source: deterministic and instant. (A random-noise JPEG source
+  // hung the sharp encoder >60s in this environment.) The per-page ceiling
+  // inspects declared image dimensions, which a flat image exercises equally.
+  const jpeg = await sharp({ create: { width: w, height: h, channels: 3, background: { r: 214, g: 222, b: 235 } } }).jpeg({ quality: jpegQuality }).toBuffer();
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const page = pdf.addPage([595, 842]);
+  const img = await pdf.embedJpg(jpeg);
+  const scale = Math.min(595 / img.width, 842 / img.height);
+  page.drawImage(img, { x: 0, y: 0, width: img.width * scale, height: img.height * scale });
+  page.drawText(`Embedded ${((w * h) / 1e6).toFixed(1)} MP image fixture`, { x: 72, y: 770, size: 12, font, color: rgb(0.1, 0.1, 0.1) });
+  page.drawText('DRAFT', { x: 140, y: 400, size: 90, font, color: rgb(0.9, 0.2, 0.2), opacity: 0.25, rotate: degrees(-30) });
   return Buffer.from(await pdf.save());
 }
 
@@ -720,9 +743,31 @@ async function runHardeningChecks(): Promise<void> {
         `got ${hp.status} ${JSON.stringify(hp.json).slice(0, 140)}`);
     }
 
+    // W07: a page embedding ~3.4 MP of image data exceeds the per-page
+    // embedded-image ceiling — rejected at UPLOAD with 413 PDF_IMAGE_TOO_LARGE
+    // (image-decode CPU scales with embedded image pixels, not file bytes;
+    // see CONFIG.MAX_PDF_IMAGE_PIXELS_PER_PAGE).
+    const heavyImagePdf = await generateEmbeddedImagePdf(2600, 1300);
+    const upHeavyImg = await upload(W, 'hostile_embedded_image.pdf', heavyImagePdf);
+    check('W07 3.4 MP/page embedded-image PDF rejected at upload → 413 PDF_IMAGE_TOO_LARGE',
+      upHeavyImg.status === 413 && upHeavyImg.json?.error?.code === 'PDF_IMAGE_TOO_LARGE',
+      `got ${upHeavyImg.status} ${JSON.stringify(upHeavyImg.json).slice(0, 140)}`);
+
     // W06: server still healthy after complexity hostiles.
     const healthW = await fetch(`http://127.0.0.1:${PORT}/health`);
     check('W06 server healthy after PDF-complexity hostiles', healthW.ok);
+
+    // W08: a legal embedded image (0.99 MP/page) still completes the full
+    // journey — the new ceiling must not over-reject ordinary documents.
+    const legalImagePdf = await generateEmbeddedImagePdf(1100, 900);
+    const upLegalImg = await upload(W, 'embedded_image_legal.pdf', legalImagePdf);
+    const anLegalImg = await analyze(W, upLegalImg.json!.document.id);
+    const prLegalImg = await processDoc(W, upLegalImg.json!.document.id, {
+      selectedCandidateIds: anLegalImg.json!.analysis.candidates.map((c: any) => c.id),
+    });
+    check('W08 0.99 MP/page embedded-image PDF completes with independent verification',
+      prLegalImg.status === 200 && ['COMPLETED', 'REVIEW_REQUIRED'].includes(prLegalImg.json?.document?.status),
+      `got ${prLegalImg.status} ${prLegalImg.json?.document?.status} ${JSON.stringify(prLegalImg.json?.verification?.status || '')}`);
   }
 
   // Gate state is observable in /health (diagnostics, no secrets).

@@ -79,6 +79,14 @@ Free has no persistent disk to host one.
   reset). Pages rendering beyond `CLEARDOC_MAX_RENDER_PIXELS=16000000` now
   fail deterministically with `400 RENDER_TOO_LARGE` in milliseconds, before
   any pixels are allocated.
+- **Embedded images.** Page-render CPU scales with the decoded pixels of the
+  images a page embeds, not with file bytes: a 6.6 MP image on one page
+  starved the event loop for >15 s on a 0.1-CPU Free instance (Render's HTTP
+  health checks then failed, routing stopped, and the in-flight request was
+  severed), while 1.4 MP/page passed the same pipeline. Pages embedding more
+  than `CLEARDOC_MAX_PDF_IMAGE_PIXELS_PER_PAGE=2000000` (2 MP) are rejected at
+  ingest with `413 PDF_IMAGE_TOO_LARGE`, before any render. Raise this only
+  together with more CPU per instance.
 - **Single instance.** Processing is admission-gated at
   `CLEARDOC_MAX_CONCURRENT_PROCESSES=1` simultaneous pipeline. Excess
   requests wait up to `CLEARDOC_PROCESS_SLOT_WAIT_MS` (5 s), then receive
@@ -144,6 +152,7 @@ HTTP handlers, bounded by the 120 s per-stage deadline.
 | `CLEARDOC_MAX_PAGE_COUNT` | `50` | PDF page limit |
 | `CLEARDOC_MAX_IMAGE_PIXELS` | `16000000` | Decoded-pixel ceiling for raster images (16 MP = largest measured-safe value for 512 MB Render Free; 20 MP measured ~522 MB peak) |
 | `CLEARDOC_MAX_TEXT_ITEMS` | `8000` | Cumulative PDF text-item ceiling — inspection stops early and rejects with `400 PDF_TOO_COMPLEX` (render memory scales with text operations, not bytes/pages) |
+| `CLEARDOC_MAX_PDF_IMAGE_PIXELS_PER_PAGE` | `2000000` | Per-page embedded-image pixel ceiling — pages embedding more image data fail with `413 PDF_IMAGE_TOO_LARGE` before any render (image-decode CPU scales with pixels, not bytes) |
 | `CLEARDOC_MAX_RENDER_PIXELS` | `16000000` | Rendered-page pixel ceiling — oversized pages fail with `400 RENDER_TOO_LARGE` instead of a native allocation crash |
 | `CLEARDOC_RETENTION_MS` | `3600000` | Temp-file retention |
 | `CLEARDOC_CLEANUP_INTERVAL_MS` | `300000` | GC cycle interval |

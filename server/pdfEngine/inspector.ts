@@ -3,7 +3,7 @@
  * Inspects PDF structure, page geometries, font inventory, text items, and annotations.
  */
 import crypto from 'crypto';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFDict, PDFName, PDFNumber, PDFStream } from 'pdf-lib';
 import { CONFIG } from '../config.js';
 import { pdfjsDocumentOptions } from './pdfjsLoader.js';
 
@@ -68,6 +68,65 @@ export interface PdfInspectionResult {
   hasNativeText: boolean;
 }
 
+/**
+ * Sums the decoded pixel area of image XObjects reachable from one page's
+ * resources (recursing into Form XObjects; includes soft masks). This bounds
+ * the per-page image-decode chunk that pdfjs performs synchronously during a
+ * page render. MEASURED (2026-10-02): a 6.6 MP image on one page stalled the
+ * Node event loop 8–25 s per render locally and >15 s on a 0.1-CPU Render Free
+ * instance (HTTP health checks failed → Render stopped routing → in-flight
+ * requests were severed), while 1.4 MP/page passed. The walk is bounded
+ * (depth 3, ≤512 streams) so hostile documents cannot explode it; inline
+ * content-stream images are not visible here and remain bounded by the
+ * file-size limit.
+ */
+function sumPageEmbeddedImagePixels(pdfLibDoc: PDFDocument, pageIndex: number): number {
+  let total = 0;
+  let budget = 512;
+  const visited = new Set<PDFStream>();
+
+  const streamPixels = (stream: PDFStream): number => {
+    const w = stream.dict.lookup(PDFName.of('Width'));
+    const h = stream.dict.lookup(PDFName.of('Height'));
+    const wn = w instanceof PDFNumber ? w.asNumber() : 0;
+    const hn = h instanceof PDFNumber ? h.asNumber() : 0;
+    return Number.isFinite(wn) && Number.isFinite(hn) && wn > 0 && hn > 0 ? wn * hn : 0;
+  };
+
+  const walkResources = (resources: unknown, depth: number): void => {
+    if (depth > 3 || budget <= 0 || !(resources instanceof PDFDict)) return;
+    const xobjects = resources.lookup(PDFName.of('XObject'));
+    if (!(xobjects instanceof PDFDict)) return;
+    for (const key of xobjects.keys()) {
+      if (budget <= 0) return;
+      const value = xobjects.lookup(key);
+      if (!(value instanceof PDFStream) || visited.has(value)) continue;
+      visited.add(value);
+      budget--;
+      const subtype = value.dict.lookup(PDFName.of('Subtype'));
+      const subtypeName = subtype instanceof PDFName ? subtype.asString() : '';
+      if (subtypeName === '/Image') {
+        total += streamPixels(value);
+        const smask = value.dict.lookup(PDFName.of('SMask'));
+        if (smask instanceof PDFStream && !visited.has(smask)) {
+          visited.add(smask);
+          total += streamPixels(smask);
+        }
+      } else if (subtypeName === '/Form') {
+        walkResources(value.dict.lookup(PDFName.of('Resources')), depth + 1);
+      }
+    }
+  };
+
+  try {
+    walkResources(pdfLibDoc.getPage(pageIndex).node.Resources(), 0);
+  } catch {
+    // Malformed resource trees must not become a new failure mode; the
+    // standard ingest validation and render ceilings still apply.
+  }
+  return total;
+}
+
 export async function inspectPdf(pdfBuffer: Buffer): Promise<PdfInspectionResult> {
   const sha256 = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
 
@@ -121,6 +180,21 @@ export async function inspectPdf(pdfBuffer: Buffer): Promise<PdfInspectionResult
     const pageWidth = viewport.width;
     const pageHeight = viewport.height;
     dimensions.push({ width: pageWidth, height: pageHeight });
+
+    // Embedded-image ceiling: reject pages whose image decode work would
+    // starve the event loop during rendering (see
+    // CONFIG.MAX_PDF_IMAGE_PIXELS_PER_PAGE for the measurements). Early-stop
+    // here, before any preview render or text extraction runs.
+    const embeddedImagePixels = sumPageEmbeddedImagePixels(pdfLibDoc, i - 1);
+    if (embeddedImagePixels > CONFIG.MAX_PDF_IMAGE_PIXELS_PER_PAGE) {
+      try { await loadingTask.destroy(); } catch { /* already torn down */ }
+      const err: any = new Error(
+        `Page ${i} embeds ${(embeddedImagePixels / 1e6).toFixed(1)} MP of image data (limit: ${Math.round(CONFIG.MAX_PDF_IMAGE_PIXELS_PER_PAGE / 1e6)} MP per page). Nothing was changed.`
+      );
+      err.code = 'PDF_IMAGE_TOO_LARGE';
+      err.status = 413;
+      throw err;
+    }
 
     const textContent = await page.getTextContent({
       includeMarkedContent: false,

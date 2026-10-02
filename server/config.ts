@@ -47,6 +47,17 @@ export const CONFIG = {
   // count predict neither. Inspection stops early at this cumulative item
   // count and the upload is rejected honestly before any preview render.
   MAX_TEXT_ITEMS: parsePositiveInt(process.env.CLEARDOC_MAX_TEXT_ITEMS, 8000, 'CLEARDOC_MAX_TEXT_ITEMS'),
+  // Per-page embedded-image pixel ceiling for PDFs. MEASURED (2026-10-02,
+  // local event-loop instrumentation + live incident): a 6.6 MP image on one
+  // page starves the Node event loop for 8–25 s per render locally and >15 s
+  // on a 0.1-CPU Render Free instance — long enough for Render's HTTP health
+  // checks to fail, which stops routing and severs in-flight requests. A
+  // 1.4 MP/page document passed the same pipeline. File bytes do NOT predict
+  // the stall (a 4 MB file with a 6.6 MP image stalled worse than a 19 MB file
+  // with the same image). Inspection rejects any page over this limit at
+  // upload, before any render. 2 MP ≈ 1.4× the largest MEASURED-safe value.
+  // Raise only with more CPU per instance; see docs/deployment.md.
+  MAX_PDF_IMAGE_PIXELS_PER_PAGE: parsePositiveInt(process.env.CLEARDOC_MAX_PDF_IMAGE_PIXELS_PER_PAGE, 2000000, 'CLEARDOC_MAX_PDF_IMAGE_PIXELS_PER_PAGE'),
   // Rendered-page pixel ceiling for PDF page previews/verification renders.
   // Mirrors MAX_IMAGE_PIXELS so a hostile page-size PDF (e.g. A0×10 ≈ 803 MP
   // at 150 dpi) fails with a deterministic JSON error instead of a native
